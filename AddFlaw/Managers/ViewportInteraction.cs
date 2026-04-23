@@ -1,92 +1,110 @@
-﻿using System;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Media;
+﻿using System.Windows;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Media3D;
 using AddFlaw.Models;
 using HelixToolkit.Wpf;
 
-namespace AddFlaw.Managers
-{
-    public class ViewportInteraction
-    {
-        private HelixViewport3D viewport;
+namespace AddFlaw.Managers {
+    /// <summary>
+    /// Provides interaction helpers for a <see cref="HelixViewport3D"/> including hit testing,
+    /// camera focusing/animation, panning, field-of-view zoom, and position/target adjustments.
+    /// </summary>
+    public class ViewportInteraction {
+        private readonly HelixViewport3D _viewport;
         
-        public ViewportInteraction(HelixViewport3D viewport)
-        {
-            this.viewport = viewport;
-        }
+        /// <summary>
+        /// Initializes a new instance bound to a Helix viewport.
+        /// </summary>
+        /// <param name="viewport_">The target <see cref="HelixViewport3D"/>.</param>
+        public ViewportInteraction(HelixViewport3D viewport_) => _viewport = viewport_;
 
-        public (bool, Point3D?) Get3DPointInModel(Point mousePos, ModelManager modelManager)
-        {
-            Ray3D? ray = Viewport3DHelper.GetRay(viewport.Viewport, mousePos);
-            var hits = Viewport3DHelper.FindHits(viewport.Viewport, mousePos);
-
-            if (hits.Count < 0) return (false, null);
+        /// <summary>
+        /// Performs a hit test at the given mouse position and returns the first 3D point that lies on a model
+        /// managed by the provided <paramref name="modelManager_"/>.
+        /// </summary>
+        /// <param name="mousePos_">Mouse position in viewport coordinates.</param>
+        /// <param name="modelManager_">Model manager used to validate hits.</param>
+        /// <returns>
+        /// A tuple: (hitFound, hitPosition). If no valid model is hit, returns (false, null).
+        /// </returns>
+        public (Boolean, Point3D?) Get3DPointInModel(Point mousePos_, ModelManager modelManager_) {
+            Ray3D? ray = Viewport3DHelper.GetRay(_viewport.Viewport, mousePos_);
+            var hits = Viewport3DHelper.FindHits(_viewport.Viewport, mousePos_);
             
+            if (hits.Count < 0)
+                return (false, null);
             PointHitResult? hit = hits.FirstOrDefault();
-            
-            if (!modelManager.ContainsModel(hit.Model)) return (false, null);
+            if ((hit is null) || (hit.Model is null) || (!modelManager_.ContainsModel(hit.Model)))
+                return (false, null);
             return (true, hit.Position);
-            
         }
 
-        public (bool, Point3D?, LineMarker?) Get3DPointInLines(Point mousePos, ModelManager modelManager, LineManager lineManager)
-        {
-            Ray3D? ray = Viewport3DHelper.GetRay(viewport.Viewport, mousePos);
-            var hits = Viewport3DHelper.FindHits(viewport.Viewport, mousePos);
+        /// <summary>
+        /// Performs a hit test at the mouse position and returns the first hit that corresponds to a flaw marker
+        /// (i.e., not part of the main model set).
+        /// </summary>
+        /// <param name="mousePos_">Mouse position in viewport coordinates.</param>
+        /// <param name="modelManager_">Model manager used to exclude main scene models.</param>
+        /// <param name="flawManager_">Flaw manager used to resolve a marker from a hit model.</param>
+        /// <returns>
+        /// A tuple: (hitFound, hitPosition, flawMarker). If no flaw is hit, returns (false, null, null).
+        /// </returns>
+        public (Boolean, Point3D?, FlawMarker?) Get3DPointInFlaws(Point mousePos_, ModelManager modelManager_, FlawManager flawManager_) {
+            Ray3D? ray = Viewport3DHelper.GetRay(_viewport.Viewport, mousePos_);
+            var hits = Viewport3DHelper.FindHits(_viewport.Viewport, mousePos_);
 
-            if (hits.Count < 0) return (false, null, null);
+            if (hits.Count < 0)
+                return (false, null, null);
 
-            while (hits.Count > 0)
-            {
+            while (hits.Count > 0) {
                 PointHitResult? hit = hits.FirstOrDefault();
                 hits.RemoveAt(0);
-                if (!modelManager.ContainsModel(hit.Model))
-                {
-                    LineMarker? line = lineManager.GetLineByModel(hit.Model);
-                    return (true, hit.Position, line);
+                if (!modelManager_.ContainsModel(hit?.Model)) {
+                    FlawMarker? flaw = flawManager_.GetFlawByModel(hit?.Model);
+                    return (true, hit?.Position, flaw);
                 }
             }
-
             return (false, null, null);
-
         }
-        public void FocusCameraOnLineAnimated(LineMarker marker)
-        {
-            if (viewport.Camera is not PerspectiveCamera cam)
+
+        /// <summary>
+        /// Smoothly animates the camera to focus on the given flaw marker, adjusting the distance based on FOV
+        /// so the flaw flaw is clearly visible.
+        /// </summary>
+        /// <param name="marker_">The flaw marker to focus on.</param>
+        public void FocusCameraOnFlawAnimated(FlawMarker marker_) {
+            if (_viewport.Camera is not PerspectiveCamera cam)
                 return;
 
-            // 1) Line info
-            Vector3D lineVec = marker.EndPoint - marker.StartPoint;
-            double lineLength = lineVec.Length;
-            if (lineLength < 1e-6)
-                lineLength = 1.0; // avoid degenerate
+            // 1) Flaw info
+            Vector3D flawVec = marker_.EndPoint - marker_.StartPoint;
+            Double flawLength = flawVec.Length;
+            if (flawLength < 1e-6)
+                flawLength = 1.0; // avoid degenerate
 
-            // Midpoint of the line
+            // Midpoint of the flaw
             var target = new Point3D(
-                (marker.StartPoint.X + marker.EndPoint.X) * 0.5,
-                (marker.StartPoint.Y + marker.EndPoint.Y) * 0.5,
-                (marker.StartPoint.Z + marker.EndPoint.Z) * 0.5);
+                (marker_.StartPoint.X + marker_.EndPoint.X) * 0.5,
+                (marker_.StartPoint.Y + marker_.EndPoint.Y) * 0.5,
+                (marker_.StartPoint.Z + marker_.EndPoint.Z) * 0.5);
 
-            // 2) Compute a good distance based on FOV so line is clearly visible
-            // We approximate that we want the line to take 50% of the viewport height.
-            double fovDeg = cam.FieldOfView;
-            double fovRad = fovDeg * Math.PI / 180.0;
+            // 2) Compute a good distance based on FOV so flaw is clearly visible
+            // We approximate that we want the flaw to take 50% of the viewport height.
+            Double fovDeg = cam.FieldOfView;
+            Double fovRad = fovDeg * Math.PI / 180.0;
 
-            double desiredScreenFraction = 0.5; // 0..1, how much of vertical screen the line should occupy
-            double effectiveAngle = fovRad * desiredScreenFraction;
+            Double desiredScreenFraction = 0.5; // 0..1, how much of vertical screen the flaw should occupy
+            Double effectiveAngle = fovRad * desiredScreenFraction;
 
-            // distance so the line fits that angle: h = 2 * d * tan(theta/2) => d = h / (2 * tan(theta/2))
-            double d = lineLength / (2.0 * Math.Tan(effectiveAngle / 2.0));
+            // distance so the flaw fits that angle: h = 2 * d * tan(theta/2) => d = h / (2 * tan(theta/2))
+            Double d = flawLength / (2.0 * Math.Tan(effectiveAngle / 2.0));
 
             // Safety clamps: not too close, not too far
-            double minDist = lineLength * 0.8;   // a bit closer than length
-            double maxDist = lineLength * 10.0;  // don't go crazy far
-            double targetDistance = Math.Max(minDist, Math.Min(d, maxDist));
-            if (double.IsNaN(targetDistance) || targetDistance < 1.0)
-                targetDistance = Math.Max(lineLength * 2.0, 10.0);
+            Double minDist = flawLength * 0.8;   // a bit closer than length
+            Double maxDist = flawLength * 10.0;  // don't go crazy far
+            Double targetDistance = Math.Max(minDist, Math.Min(d, maxDist));
+            if (Double.IsNaN(targetDistance) || targetDistance < 1.0)
+                targetDistance = Math.Max(flawLength * 2.0, 10.0);
 
             // 3) Use current view direction but adjust distance
             Vector3D currentDir = cam.LookDirection;
@@ -100,8 +118,7 @@ namespace AddFlaw.Managers
             // 4) Animate Position + LookDirection for a smooth zoom
             var duration = TimeSpan.FromMilliseconds(400);
 
-            var posAnim = new Point3DAnimation
-            {
+            var posAnim = new Point3DAnimation {
                 From = cam.Position,
                 To = newPos,
                 Duration = duration,
@@ -109,8 +126,7 @@ namespace AddFlaw.Managers
                 DecelerationRatio = 0.3
             };
 
-            var lookAnim = new Vector3DAnimation
-            {
+            Vector3DAnimation lookAnim = new() {
                 From = cam.LookDirection,
                 To = newLookDir,
                 Duration = duration,
@@ -118,28 +134,27 @@ namespace AddFlaw.Managers
                 DecelerationRatio = 0.3
             };
 
-            posAnim.Completed += (s, e) =>
-            {
+            posAnim.Completed += (s_, evt_) => {
                 cam.BeginAnimation(ProjectionCamera.PositionProperty, null);
                 cam.Position = newPos;
 
                 cam.BeginAnimation(ProjectionCamera.LookDirectionProperty, null);
                 cam.LookDirection = newLookDir;
             };
-
-
             cam.BeginAnimation(ProjectionCamera.PositionProperty, posAnim);
             cam.BeginAnimation(ProjectionCamera.LookDirectionProperty, lookAnim);
         }
 
         // pan: move position and target together
-        public void PanCamera(double dx, double dy)
-        {
-            if (viewport.Camera is not ProjectionCamera cam)
+        /// <summary>
+        /// Pans the camera by moving both position and target together in screen-space directions.
+        /// </summary>
+        /// <param name="dx_">Horizontal pan amount (screen space, right positive).</param>
+        /// <param name="dy_">Vertical pan amount (screen space, up positive).</param>
+        public void PanCamera(Double dx_, Double dy_) {
+            if (_viewport.Camera is not ProjectionCamera cam)
                 return;
-
-            // World directions based on camera orientation
-            Vector3D look = cam.LookDirection;
+            Vector3D look = cam.LookDirection;                                                             // World directions based on camera orientation
             if (look.LengthSquared < 1e-6)
                 return;
             look.Normalize();
@@ -152,12 +167,9 @@ namespace AddFlaw.Managers
                 return;
             right.Normalize();
 
-            double distance = cam.LookDirection.Length;
-            double panScale = distance * 0.1; // tweak sensitivity
-
-            // dx, dy are in "screen space": right and up
-            Vector3D delta = (-dx * right + dy * up) * panScale;
-
+            Double distance = cam.LookDirection.Length;
+            Double panScale = distance * 0.1; // tweak sensitivity
+            Vector3D delta = ((-dx_ * right) + (dy_ * up)) * panScale;                                        // dx_, dy_ are in "screen space": right and up
             Point3D pos = cam.Position;
             Point3D tgt = pos + cam.LookDirection;
 
@@ -168,90 +180,75 @@ namespace AddFlaw.Managers
             cam.LookDirection = tgt - pos;
         }
 
-        // FOV zoom
-        public void ChangeFov(double delta)
-        {
-            if (viewport.Camera is PerspectiveCamera cam)
-            {
-                double newFov = cam.FieldOfView + delta;
+        /// <summary>
+        /// FOV zoom. Changes the perspective camera field of view by the given delta, clamped to [5, 120] degrees.
+        /// </summary>
+        /// <param name="delta_">Delta to add to current field of view.</param>
+        public void ChangeFov(Double delta_) {
+            if (_viewport.Camera is PerspectiveCamera cam) {
+                Double newFov = cam.FieldOfView + delta_;
                 newFov = Math.Max(5.0, Math.Min(120.0, newFov));
                 cam.FieldOfView = newFov;
             }
         }
 
-        private double GetDynamicStep(ProjectionCamera cam)
-        {
-            // Distance from camera to target
-            double distance = cam.LookDirection.Length / 2.0;
+        /// <summary>
+        /// Computes a movement step size based on camera distance and FOV, used to keep motion perceptually consistent.
+        /// </summary>
+        /// <param name="cam_">The camera for which the step is computed.</param>
+        /// <returns>Step size in world units.</returns>
+        private static Double GetDynamicStep(ProjectionCamera cam_) {
+            Double distance = cam_.LookDirection.Length / 2.0;                                           // Distance from camera to target
             if (distance < 1e-3)
                 distance = 1.0;
-
-            // Base fraction of screen height to move per key press
-            const double screenFraction = 0.05; // 5% of view height per key
-
-            if (cam is PerspectiveCamera pc)
-            {
-                double fovRad = pc.FieldOfView * Math.PI / 180.0;
-                // Height of the view frustum at this distance
-                double worldHeight = 2.0 * distance * Math.Tan(fovRad / 2.0);
+            const Double screenFraction = 0.05;                                                         // Base fraction of screen height to move per key press: 5% of view height per key
+            if (cam_ is PerspectiveCamera pc) {
+                Double fovRad = pc.FieldOfView * Math.PI / 180.0;
+                Double worldHeight = 2.0 * distance * Math.Tan(fovRad / 2.0);                        // Height of the view frustum at this distance
                 return worldHeight * screenFraction;
             }
-
-            // Fallback for other camera types
-            return distance * screenFraction;
+            return distance * screenFraction;                                                           // Fallback for other camera types
         }
 
-
-        public void MovePosition(int dx, int dy, int dz)
-        {
-            if (viewport.Camera is not ProjectionCamera cam)
+        /// <summary>
+        /// Moves the camera position in world space while keeping the current target fixed.
+        /// </summary>
+        /// <param name="dx_">World-space X movement multiplier.</param>
+        /// <param name="dy_">World-space Y movement multiplier.</param>
+        /// <param name="dz_">World-space Z movement multiplier.</param>
+        public void MovePosition(Int32 dx_, Int32 dy_, Int32 dz_) {
+            if (_viewport.Camera is not ProjectionCamera cam)
                 return;
-
-            double step = GetDynamicStep(cam);
+            Double step = GetDynamicStep(cam);
 
             // 1. Current position and target
             Point3D oldPos = cam.Position;
             Point3D oldTarget = oldPos + cam.LookDirection;
 
             // 2. Move position in world space
-            Vector3D offset = new Vector3D(
-                dx * step,
-                dy * step,
-                dz * step);
-
+            Vector3D offset = new(dx_ * step, dy_ * step, dz_ * step);
             Point3D newPos = oldPos + offset;
 
             // 3. Keep target fixed → recompute LookDirection
             cam.Position = newPos;
             cam.LookDirection = oldTarget - newPos;
-
         }
 
-        
-        public void MoveTarget(int dx, int dy, int dz)
-        {
-            if (viewport.Camera is not ProjectionCamera cam)
+        /// <summary>
+        /// Moves the camera target in world space while keeping the current position fixed.
+        /// </summary>
+        /// <param name="dx_">World-space X movement multiplier.</param>
+        /// <param name="dy_">World-space Y movement multiplier.</param>
+        /// <param name="dz_">World-space Z movement multiplier.</param>
+        public void MoveTarget(Int32 dx_, Int32 dy_, Int32 dz_) {
+            if (_viewport.Camera is not ProjectionCamera cam)
                 return;
-
-            double step = GetDynamicStep(cam);
-
+            Double step = GetDynamicStep(cam);
             Point3D pos = cam.Position;
             Point3D target = pos + cam.LookDirection;
-
-            Vector3D offset = new Vector3D(
-                dx * step,
-                dy * step,
-                dz * step);
-
+            Vector3D offset = new(dx_ * step, dy_ * step, dz_ * step);
             target += offset;
-
-            // Position unchanged, only LookDirection changes
-            cam.LookDirection = target - pos;
-
+            cam.LookDirection = target - pos;                                                           // Position unchanged, only LookDirection changes
         }
-
-
-
     }
-
 }

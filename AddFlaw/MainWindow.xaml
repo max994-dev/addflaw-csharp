@@ -6,7 +6,7 @@
         xmlns:HelixToolkit="clr-namespace:HelixToolkit.Wpf;assembly=HelixToolkit.Wpf"
         xmlns:local="clr-namespace:AddFlaw"
         mc:Ignorable="d"
-        Title="AddFlaw - 3D Flaw Adding Tool" Height="720" Width="1280"
+        Title="AddFlaw - 3D Flaw Adding Tool" Height="1024" Width="1200"
         Background="#F0F0F0" PreviewKeyDown="Window_PreviewKeyDown" PreviewKeyUp="Window_PreviewKeyUp">
     <Grid>
         <Grid.RowDefinitions>
@@ -23,17 +23,17 @@
                         Content="📁 Open Model" Foreground="White" Background="#0078D4" 
                         Padding="12,8" FontSize="12" FontWeight="Bold" Cursor="Hand"
                         BorderThickness="0"  Margin="0,0,10,0" />
-                <Button x:Name="loadLinesButton" Click="LoadLinesButton_Click" 
-                        Content="Load Lines" Foreground="White" Background="#0078D4" 
+                <Button x:Name="loadFlawsButton" Click="LoadFlawsButton_Click" 
+                        Content="Load Flaws" Foreground="White" Background="#0078D4" 
                         Padding="12,8" FontSize="12" FontWeight="Bold" Cursor="Hand"
                         BorderThickness="0"  Margin="0,0,10,0" />
-                <Button x:Name="SaveLinesButton" Click="SaveLinesButton_Click" 
-                        Content="Save Lines" Foreground="White" Background="#0078D4" 
+                <Button x:Name="SaveFlawsButton" Click="SaveFlawsButton_Click" 
+                        Content="Save Flaws" Foreground="White" Background="#0078D4" 
                         Padding="12,8" FontSize="12" FontWeight="Bold" Cursor="Hand"
                         BorderThickness="0"  Margin="0,0,10,0" />
 
-                <Button x:Name="addLineButton" Click="AddLineButton_Click" 
-                        Content="➕ Add Line" Foreground="White" Background="#28A745" 
+                <Button x:Name="addFlawButton" Click="AddFlawButton_Click" 
+                        Content="➕ Add Flaw" Foreground="White" Background="#28A745" 
                         Padding="12,8" FontSize="12" FontWeight="Bold" Cursor="Hand"
                         BorderThickness="0"  Margin="0,0,10,0" />
 
@@ -54,9 +54,9 @@
 
 
 
-                <TextBlock Text="Line Color:" Foreground="White" VerticalAlignment="Center" Margin="0,0,5,0" />
-                <ComboBox x:Name="lineColorCombo" Width="80" Margin="0,0,0,0" VerticalAlignment="Center"
-                          SelectionChanged="LineColorCombo_SelectionChanged">
+                <TextBlock Text="Flaw Color:" Foreground="White" VerticalAlignment="Center" Margin="0,0,5,0" />
+                <ComboBox x:Name="flawColorCombo" Width="80" Margin="0,0,0,0" VerticalAlignment="Center"
+                          SelectionChanged="FlawColorCombo_SelectionChanged">
                     <ComboBoxItem Content="Red" IsSelected="True" />
                     <ComboBoxItem Content="Green" />
                 </ComboBox>
@@ -67,144 +67,60 @@
                            VerticalAlignment="Center" Margin="10,0,5,0" />
 
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <Slider x:Name="EmissionAlphaSlider"
-                            Minimum="0"
-                            Maximum="128"
-                            Value="20"
-                            Width="140"
-                            TickFrequency="15"
-                            IsSnapToTickEnabled="True"
-                            Margin="0,0,5,0"
-                            ToolTip="Adjust emissive glow strength (0 = off, 128 = max)"
-                            ValueChanged="EmissionAlphaSlider_ValueChanged" />
+                    <Slider x:Name="EmissionAlphaSlider" Minimum="0" Maximum="128" Value="20" Width="140" TickFrequency="15" IsSnapToTickEnabled="True" Margin="0,0,5,0" ToolTip="Adjust emissive glow strength (0 = off, 128 = max)" ValueChanged="EmissionAlphaSlider_ValueChanged" />
                     <Border Background="#404040" CornerRadius="3" Padding="4,1" VerticalAlignment="Center">
-                        <TextBlock x:Name="EmissionAlphaLabel"
-                                   Text="60"
-                                   Foreground="White"
-                                   FontSize="11"
-                                   VerticalAlignment="Center" />
+                        <TextBlock x:Name="EmissionAlphaLabel" Text="60" Foreground="White" FontSize="11" VerticalAlignment="Center" />
                     </Border>
                 </StackPanel>
-
                 <Separator Background="#404040" Width="1" Margin="5,0" />
-
-                <CheckBox x:Name="showAxisCheckBox" 
-                          Content="Show Axis" 
-                          Foreground="White" 
-                          IsChecked="True"
-                          FontSize="12"
-                          VerticalAlignment="Center"
-                          Margin="10,0,0,0"
-                          Checked="ShowAxisCheckBox_Checked"
-                          Unchecked="ShowAxisCheckBox_Unchecked" />
+                <CheckBox x:Name="showAxisCheckBox" Content="Show Axis" Foreground="White" IsChecked="True" FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ShowAxisCheckBox_Checked" Unchecked="ShowAxisCheckBox_Unchecked" />
             </StackPanel>
         </Border>
 
         <!-- Info Bar -->
         <Border Grid.Row="1" Background="#E8E8E8" Padding="10">
             <StackPanel Orientation="Horizontal">
-                <TextBlock Text="Lines placed:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" />
-                <TextBlock x:Name="linesCountLabel" Text="0" Foreground="#0078D4" FontSize="11" 
-                           FontWeight="Bold" VerticalAlignment="Center" Margin="5,0,0,0" />
-                <TextBlock Text="Selected line:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" Margin="23,0,0,0" />
-                <TextBlock x:Name="selectedLineIdLabel" Text="None" Foreground="#0078D4" FontSize="11"
-                    FontWeight="Bold" VerticalAlignment="Center" Margin="5,0,20,0" />
-
+                <TextBlock Text="Flaws placed:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" />
+                <TextBlock x:Name="flawsCountLabel" Text="0" Foreground="#0078D4" FontSize="11" FontWeight="Bold" VerticalAlignment="Center" Margin="5,0,0,0" />
+                <TextBlock Text="Selected flaw:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" Margin="23,0,0,0" />
+                <TextBlock x:Name="selectedFlawIdLabel" Text="None" Foreground="#0078D4" FontSize="11" FontWeight="Bold" VerticalAlignment="Center" Margin="5,0,20,0" />
                 <TextBlock Text="Label:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" />
-                <TextBox x:Name="lineLabelTextBox"
-                     Width="300"
-                     FontSize="11"
-                     Margin="5,0,0,0"
-                     VerticalAlignment="Center"
-                     LostFocus="LineLabelTextBox_LostFocus"
-                     />
-
-                <Button x:Name="applyLineLabelButton"
-                    Content="Apply"
-                    FontSize="11"
-                    Padding="8,2"
-                    Margin="0,0,0,0"
-                    Background="#0078D4"
-                    Foreground="White"
-                    BorderThickness="0"
-                    Cursor="Hand"
-                    IsEnabled="False"
-                    Click="ApplyLineLabelButton_Click"
-                    LostFocus="ApplyLineLabelButton_LostFocus" />
+                <TextBox x:Name="flawLabelTextBox" Width="300" FontSize="11" Margin="5,0,0,0" VerticalAlignment="Center" LostFocus="FlawLabelTextBox_LostFocus" />
+                <Button x:Name="applyFlawLabelButton" Content="Apply" FontSize="11" Padding="8,2" Margin="0,0,0,0" Background="#0078D4" Foreground="White" BorderThickness="0" Cursor="Hand" IsEnabled="False" 
+                        Click="ApplyFlawLabelButton_Click" LostFocus="ApplyFlawLabelButton_LostFocus" />
             </StackPanel>
         </Border>
 
         <!-- 3D Viewport -->
         <Grid Grid.Row="2">
-            <HelixToolkit:HelixViewport3D 
-                x:Name="viewport3D" 
-                ShowCameraInfo="True"
-                ZoomExtentsWhenLoaded="True"
-                ZoomAroundMouseDownPoint="True"
-                ShowCoordinateSystem="True"
-                >
-
+            <HelixToolkit:HelixViewport3D x:Name="viewport3D"  ShowCoordinateSystem="True"  ShowCameraInfo="True" ZoomExtentsWhenLoaded="True" ZoomAroundMouseDownPoint="True" 
+                                          IsChangeFieldOfViewEnabled="True" IsMoveEnabled="True" IsRotationEnabled="True" >
                 <HelixToolkit:DefaultLights />
                 <ModelVisual3D x:Name="modelRoot" />
-
-
-
             </HelixToolkit:HelixViewport3D>
-
-            <!-- Lines List Overlay (left, like measurement/annotation list in CAD/3D Slicer) -->
-            <Border HorizontalAlignment="Left"
-                VerticalAlignment="Top"
-                Margin="15,50,15,15"
-                Background="#CCF5F5F5"
-                CornerRadius="4"
-                Padding="8"
-                Width="230">
+            <!-- Flaws List Overlay (left, like measurement/annotation list in CAD/3D Slicer) -->
+            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="15,50,15,15" Background="#CCF5F5F5" CornerRadius="4" Padding="8" Width="230">
                 <DockPanel>
-                    <TextBlock Text="Lines"
-                       DockPanel.Dock="Top"
-                       FontWeight="Bold"
-                       FontSize="12"
-                       Foreground="#333333"
-                       Margin="0,0,0,4" />
-
-                    <ListBox x:Name="lineListBox"
-        FontSize="12"
-        Background="#00000000"
-        BorderThickness="0"
-        SelectionChanged="LineListBox_SelectionChanged"
-        MouseDoubleClick="LineListBox_MouseDoubleClick"
-        LostFocus="LineListBox_LostFocus">
-
+                    <TextBlock Text="Flaws" DockPanel.Dock="Top" FontWeight="Bold" FontSize="12" Foreground="#333333" Margin="0,0,0,4" />
+                    <ListBox x:Name="flawListBox" FontSize="12" Background="#00000000" BorderThickness="0" SelectionChanged="FlawListBox_SelectionChanged" MouseDoubleClick="FlawListBox_MouseDoubleClick" HorizontalContentAlignment="Stretch" LostFocus="FlawListBox_LostFocus" >
                         <ListBox.Resources>
-
-                            <!-- Item Style -->
-                            <Style TargetType="ListBoxItem">
+                            <Style TargetType="ListBoxItem">                                                  <!-- Item Style -->
                                 <Setter Property="Padding" Value="6"/>
                                 <Setter Property="Margin" Value="0,2"/>
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
                                 <Setter Property="Cursor" Value="Hand"/>
                                 <Setter Property="Template">
                                     <Setter.Value>
                                         <ControlTemplate TargetType="ListBoxItem">
-                                            <Border x:Name="border"
-                                Background="#F3F3F3"
-                                CornerRadius="4"
-                                Padding="6">
+                                            <Border x:Name="border" Background="#F3F3F3" CornerRadius="4" Padding="6">
                                                 <ContentPresenter />
                                             </Border>
-
                                             <ControlTemplate.Triggers>
-
-                                                <!-- Hover -->
-                                                <Trigger Property="IsMouseOver" Value="True">
+                                                <Trigger Property="IsMouseOver" Value="True">                 <!-- Hover -->
                                                     <Setter TargetName="border" Property="Background" Value="#E2E2E2"/>
                                                 </Trigger>
-
-                                                <!-- Selected -->
-                                                <Trigger Property="IsSelected" Value="True">
+                                                <Trigger Property="IsSelected" Value="True">                   <!-- Selected -->
                                                     <Setter TargetName="border" Property="Background" Value="#D0E7FF"/>
                                                 </Trigger>
-
                                             </ControlTemplate.Triggers>
                                         </ControlTemplate>
                                     </Setter.Value>
@@ -217,53 +133,23 @@
                             <DataTemplate>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <!-- ID -->
-                                        <ColumnDefinition Width="10"/>
-                                        <!-- Spacing -->
-                                        <ColumnDefinition Width="*"/>
-                                        <!-- Label -->
-                                        <ColumnDefinition Width="Auto"/>
-                                        <!-- Color Icon -->
+                                        <ColumnDefinition Width="Auto"/>    <!-- ID -->
+                                        <ColumnDefinition Width="10"/>      <!-- Spacing -->
+                                        <ColumnDefinition Width="*"/>       <!-- Label -->
+                                        <ColumnDefinition Width="Auto"/>    <!-- Color Icon -->
                                     </Grid.ColumnDefinitions>
-
-                                    <!-- ID Badge -->
-                                    <Border Background="#0078D4"
-                        CornerRadius="3"
-                        Padding="4,1">
-                                        <TextBlock Text="{Binding Id}"
-                               Foreground="White"
-                               FontSize="11"
-                               FontWeight="Bold"/>
+                                    <Border Background="#0078D4" CornerRadius="3" Padding="4,1">
+                                        <TextBlock Text="{Binding Id}" Foreground="White" FontSize="11" FontWeight="Bold"/>   <!-- ID Badge -->
                                     </Border>
-
-                                    <!-- Label -->
-                                    <TextBlock Grid.Column="2"
-                           Text="{Binding Label}"
-                           FontSize="12"
-                           Foreground="#333"
-                           TextTrimming="CharacterEllipsis"/>
-
-                                    <Button Grid.Column="3"
-                    Width="18"
-                    Height="18"
-                    Margin="10,0,0,0"
-                    Padding="0"
-                    BorderThickness="0"
-                    Background="{Binding ColorBrush}"
-                    Tag="{Binding}"
-                    PreviewMouseLeftButtonDown="LineColorButton_PreviewMouseLeftButtonDown"
-                    PreviewMouseLeftButtonUp="LineColorButton_PreviewMouseLeftButtonUp"
-                    LostMouseCapture="LineColorButton_LostMouseCapture">
+                                    <TextBlock Grid.Column="2" Text="{Binding Label}" FontSize="12" Foreground="#333" TextTrimming="CharacterEllipsis"/>
+                                    <Button Grid.Column="3" Width="18" Height="18" Margin="10,0,0,0" Padding="0" BorderThickness="0" Background="{Binding ColorBrush}" Tag="{Binding}" PreviewMouseLeftButtonDown="FlawColorButton_PreviewMouseLeftButtonDown"
+                                            PreviewMouseLeftButtonUp="FlawColorButton_PreviewMouseLeftButtonUp" LostMouseCapture="FlawColorButton_LostMouseCapture">
                                         <Button.Template>
                                             <ControlTemplate TargetType="Button">
-                                                <Border CornerRadius="9"
-                                Background="{TemplateBinding Background}">
-                                                </Border>
+                                                <Border CornerRadius="9" Background="{TemplateBinding Background}"/>
                                             </ControlTemplate>
                                         </Button.Template>
                                     </Button>
-
                                 </Grid>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
@@ -271,21 +157,12 @@
 
                 </DockPanel>
             </Border>
-
             <!-- View Navigation Pad (top-right, similar to nav widgets in Fusion/Blender/SketchUp) -->
-            <Border HorizontalAlignment="Right"
-            VerticalAlignment="Top"
-            Margin="15"
-            Background="#66000000"
-            CornerRadius="6"
-            Padding="6">
+            <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="15" Background="#66000000" CornerRadius="6" Padding="6">
                 <StackPanel>
-                    <TextBlock Text="View"
-                       FontWeight="Bold"
-                       FontSize="11"
-                       Foreground="White"
-                       HorizontalAlignment="Center"
-                       Margin="0,0,0,4" />
+                    <Label Content="Arrows for Position" FontWeight="Bold" FontSize="11" Foreground="White" HorizontalAlignment="Center" Padding="0" />
+                    <Label Content="Shift for Target" FontWeight="Bold" FontSize="11" Foreground="White" HorizontalAlignment="Center" Padding="0" />
+                    <Label Content="Control for Pos" FontWeight="Bold" FontSize="11" Foreground="White" HorizontalAlignment="Center" Padding="0" />
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -297,158 +174,55 @@
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-
-                        <!-- Up -->
-                        <Button Grid.Row="0" Grid.Column="1"
-                        Width="28" Height="28"
-                        Content="▲"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Pan view up"
-                        Click="ViewUpButton_Click" />
-
-                        <!-- Left -->
-                        <Button Grid.Row="1" Grid.Column="0"
-                        Width="28" Height="28"
-                        Content="◀"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Pan view left"
-                        Click="ViewLeftButton_Click" />
-
-                        <!-- Center = Zoom Extents -->
-                        <Button Grid.Row="1" Grid.Column="1"
-                        Width="28" Height="28"
-                        Content="●"
-                        FontSize="10"
-                        Margin="2"
-                        Background="#555555"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Zoom extents"
-                        Click="ViewCenterButton_Click" />
-
-                        <!-- Right -->
-                        <Button Grid.Row="1" Grid.Column="2"
-                        Width="28" Height="28"
-                        Content="▶"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Pan view right"
-                        Click="ViewRightButton_Click" />
-
-                        <!-- Down -->
-                        <Button Grid.Row="2" Grid.Column="1"
-                        Width="28" Height="28"
-                        Content="▼"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Pan view down"
-                        Click="ViewDownButton_Click" />
+                        <Button Grid.Row="0" Grid.Column="0" Width="28" Height="28" Content="O" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Wide Field of View" Click="ExpandFieldOfView_Click" />
+                        <Button Grid.Row="0" Grid.Column="1" Width="28" Height="28" Content="▲" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Y Axis -" Click="WalkUpButton_Click" />
+                        <Button Grid.Row="0" Grid.Column="2" Width="28" Height="28" Content="+" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Z Axis +" Click="WalkInButton_Click" />
+                        <Button Grid.Row="1" Grid.Column="0" Width="28" Height="28" Content="◀" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="X Axis +" Click="WalkLeftButton_Click" />
+                        <Button Grid.Row="1" Grid.Column="1" Width="28" Height="28" Content="●" FontSize="10" Margin="2" Background="#555555" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Zoom extents" Click="WalkCenterButton_Click" />
+                        <Button Grid.Row="1" Grid.Column="2" Width="28" Height="28" Content="▶" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="X Axis +" Click="WalkRightButton_Click" />
+                        <Button Grid.Row="2" Grid.Column="0" Width="28" Height="28" Content="-" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Z Axis -" Click="WalkOutButton_Click" />
+                        <Button Grid.Row="2" Grid.Column="1" Width="28" Height="28" Content="▼" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Y Axis +" Click="WalkDownButton_Click" />
+                        <Button Grid.Row="2" Grid.Column="2" Width="28" Height="28" Content="o" FontSize="12" Margin="2" Background="#333333" Foreground="White" BorderThickness="0" Cursor="Hand" ToolTip="Narrow Field of View" Click="NarrowFieldOfView_Click" />
                     </Grid>
-
-                    <!-- Zoom in/out row -->
-                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,4,0,0">
-                        <Button Width="28" Height="24"
-                        Content="+"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Zoom in (FOV -)"
-                        Click="ViewZoomInButton_Click" />
-                        <Button Width="28" Height="24"
-                        Content="−"
-                        FontSize="12"
-                        Margin="2"
-                        Background="#333333"
-                        Foreground="White"
-                        BorderThickness="0"
-                        Cursor="Hand"
-                        ToolTip="Zoom out (FOV +)"
-                        Click="ViewZoomOutButton_Click" />
+                </StackPanel>
+            </Border>
+            <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="15,180,15,90" Background="#66000000" CornerRadius="4" Padding="6">
+                <StackPanel>
+                    <Label Content="Key Legend" FontWeight="Bold" FontSize="11" Foreground="White" Margin="0,0,0,4" Padding="0" HorizontalAlignment="Center" />
+                    <Label Content="Position (Ctrl + Key):" FontSize="10"  Foreground="#F0F0F0" Margin="0" Padding="0" />
+                    <Label Content="  X: Left / Right" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                    <Label Content="  Y: Up / Down" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                    <Label Content="  Z: Plus (+) / Minus (-)" FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
+                    <Label Content="Target (Shift + Key):" FontSize="10" Foreground="#F0F0F0" Margin="0" Padding="0" />
+                    <Label Content="  X: Left / Right" FontSize="10" Foreground="#DDDDDD" Margin="0" Padding="0" />
+                    <Label Content="  Y: Up / Down"  FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                    <Label Content="  Z: Plus (+) / Minus (-)"  FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
+                    <Label Content="Field of View:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  O  /  o"  FontSize="10"  Foreground="#DDDDDD" Padding="0" />
+                    <Label Content="Keys:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Arrow Keys = Move Target" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  W + S = Back and Forth " FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  A + D = Left and Right" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Q + Z = Up and Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Home = Reset" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + F = Front View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + B = Back View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + L = Left View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + R = Right View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + U = Up" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Ctrl + D = Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="Mouse:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                    <Label Content="  Wheel = Zoom" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                    <Label Content="  Sh + R. Btn + Drag = Pan" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                    <Label Content="  R. Btn + Drag = Orbit" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                    <StackPanel Orientation="Horizontal">
+                        <Label Content=" X " Foreground="Cyan" />
+                        <Label Content=" Y " Foreground="Magenta" />
+                        <Label Content=" Z " Foreground="DarkGoldenrod" />
                     </StackPanel>
                 </StackPanel>
             </Border>
-
-
-            <!-- Key Mapping Legend (bottom-left, near frame rate/FOV area) -->
-            <Border HorizontalAlignment="Right"
-                VerticalAlignment="Top"
-                Margin="15,180,15,15"
-                Background="#66000000"
-                CornerRadius="4"
-                Padding="6">
-                <StackPanel>
-                    <TextBlock Text="Key Legend" 
-                       FontWeight="Bold"
-                       FontSize="11"
-                       Foreground="White"
-                       Margin="0,0,0,4" />
-
-                    <!-- Position controls -->
-                    <TextBlock Text="Position (Ctrl + Key):" 
-                       FontSize="10" 
-                       Foreground="#F0F0F0" />
-                    <TextBlock Text="  X: Left / Right" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD" />
-                    <TextBlock Text="  Y: Up / Down" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD" />
-                    <TextBlock Text="  Z: Plus (+) / Minus (-)" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD"
-                       Margin="0,0,0,4" />
-
-                    <!-- Target controls -->
-                    <TextBlock Text="Target (Shift + Key):" 
-                       FontSize="10" 
-                       Foreground="#F0F0F0" />
-                    <TextBlock Text="  X: Shift + Left / Right" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD" />
-                    <TextBlock Text="  Y: Shift + Up / Down" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD" />
-                    <TextBlock Text="  Z: Shift + + / -" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD"
-                       Margin="0,0,0,4" />
-
-                    <!-- FOV controls -->
-                    <TextBlock Text="Field of View:" 
-                       FontSize="10" 
-                       Foreground="#F0F0F0" />
-                    <TextBlock Text="  PageUp / PageDown" 
-                       FontSize="10" 
-                       Foreground="#DDDDDD" />
-                </StackPanel>
-            </Border>
-
         </Grid>
-
-
-        <!-- Status Bar -->
         <StatusBar Grid.Row="3" Background="#E8E8E8" Padding="10">
             <TextBlock x:Name="statusLabel" Text="Ready" Foreground="#333333" FontSize="11" />
         </StatusBar>
