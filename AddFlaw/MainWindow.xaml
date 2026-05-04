@@ -74,12 +74,13 @@
                 </StackPanel>
                 <Separator Background="#404040" Width="1" Margin="5,0" />
                 <CheckBox x:Name="showAxisCheckBox" Content="Show Axis" Foreground="White" IsChecked="True" FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ShowAxisCheckBox_Checked" Unchecked="ShowAxisCheckBox_Unchecked" />
+                <CheckBox x:Name="wireframeCheckBox" Content="Wireframe" Foreground="White" IsChecked="False" FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0" Checked="WireframeCheckBox_Checked" Unchecked="WireframeCheckBox_Unchecked" />
             </StackPanel>
         </Border>
 
         <!-- Info Bar -->
         <Border Grid.Row="1" Background="#E8E8E8" Padding="10">
-            <StackPanel Orientation="Horizontal">
+            <WrapPanel Orientation="Horizontal">
                 <TextBlock Text="Flaws placed:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" />
                 <TextBlock x:Name="flawsCountLabel" Text="0" Foreground="#0078D4" FontSize="11" FontWeight="Bold" VerticalAlignment="Center" Margin="5,0,0,0" />
                 <TextBlock Text="Selected flaw:" Foreground="#333333" FontSize="11" VerticalAlignment="Center" Margin="23,0,0,0" />
@@ -88,7 +89,24 @@
                 <TextBox x:Name="flawLabelTextBox" Width="300" FontSize="11" Margin="5,0,0,0" VerticalAlignment="Center" LostFocus="FlawLabelTextBox_LostFocus" />
                 <Button x:Name="applyFlawLabelButton" Content="Apply" FontSize="11" Padding="8,2" Margin="0,0,0,0" Background="#0078D4" Foreground="White" BorderThickness="0" Cursor="Hand" IsEnabled="False" 
                         Click="ApplyFlawLabelButton_Click" LostFocus="ApplyFlawLabelButton_LostFocus" />
-            </StackPanel>
+                <Separator Width="10"/>
+                <TextBlock Text="Point Spacing (in):" Foreground="#333333" FontSize="11" VerticalAlignment="Center" Margin="8,0,4,0" />
+                <TextBox x:Name="pointSpacingTextBox" Width="48" Text="0.1" FontSize="11" VerticalAlignment="Center" LostFocus="PointSpacingTextBox_LostFocus"/>
+                <Button x:Name="setPointSpacingButton" Content="Set" FontSize="11" Padding="6,2" Margin="4,0,0,0"
+                        Background="#0078D4" Foreground="White" BorderThickness="0" Cursor="Hand"
+                        Click="SetPointSpacingButton_Click" />
+                <Button x:Name="drawOneLineButton" Content="Draw Line" FontSize="11" Padding="8,2" Margin="8,0,0,0"
+                        Background="#0078D4" Foreground="White" BorderThickness="0" Cursor="Hand"
+                        Click="DrawOneLineButton_Click" />
+                <Button x:Name="showProbeButton" Content="Show Probe: OFF" FontSize="11" Padding="8,2" Margin="8,0,0,0"
+                        Background="#6C757D" Foreground="White" BorderThickness="0" Cursor="Hand"
+                        Visibility="Collapsed"
+                        Click="ShowProbeButton_Click" />
+                <Button x:Name="exportSensorCsvButton" Content="Export Sensor CSV" FontSize="11" Padding="8,2" Margin="8,0,0,0"
+                        Background="#0078D4" Foreground="White" BorderThickness="0" Cursor="Hand"
+                        Visibility="Collapsed"
+                        Click="ExportSensorCsvButton_Click" />
+            </WrapPanel>
         </Border>
 
         <!-- 3D Viewport -->
@@ -186,42 +204,50 @@
                     </Grid>
                 </StackPanel>
             </Border>
-            <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="15,180,15,90" Background="#66000000" CornerRadius="4" Padding="6">
-                <StackPanel>
-                    <Label Content="Key Legend" FontWeight="Bold" FontSize="11" Foreground="White" Margin="0,0,0,4" Padding="0" HorizontalAlignment="Center" />
-                    <Label Content="Position (Ctrl + Key):" FontSize="10"  Foreground="#F0F0F0" Margin="0" Padding="0" />
-                    <Label Content="  X: Left / Right" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
-                    <Label Content="  Y: Up / Down" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
-                    <Label Content="  Z: Plus (+) / Minus (-)" FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
-                    <Label Content="Target (Shift + Key):" FontSize="10" Foreground="#F0F0F0" Margin="0" Padding="0" />
-                    <Label Content="  X: Left / Right" FontSize="10" Foreground="#DDDDDD" Margin="0" Padding="0" />
-                    <Label Content="  Y: Up / Down"  FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
-                    <Label Content="  Z: Plus (+) / Minus (-)"  FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
-                    <Label Content="Field of View:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  O  /  o"  FontSize="10"  Foreground="#DDDDDD" Padding="0" />
-                    <Label Content="Keys:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Arrow Keys = Move Target" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  W + S = Back and Forth " FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  A + D = Left and Right" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Q + Z = Up and Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Home = Reset" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + F = Front View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + B = Back View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + L = Left View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + R = Right View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + U = Up" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Ctrl + D = Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="Mouse:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
-                    <Label Content="  Wheel = Zoom" FontSize="10" Foreground="#DDDDDD" Padding="0" />
-                    <Label Content="  Sh + R. Btn + Drag = Pan" FontSize="10" Foreground="#DDDDDD" Padding="0" />
-                    <Label Content="  R. Btn + Drag = Orbit" FontSize="10" Foreground="#DDDDDD" Padding="0" />
-                    <StackPanel Orientation="Horizontal">
-                        <Label Content=" X " Foreground="Cyan" />
-                        <Label Content=" Y " Foreground="Magenta" />
-                        <Label Content=" Z " Foreground="DarkGoldenrod" />
+            <StackPanel HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="15">
+                <Border Background="#66000000" CornerRadius="4" Padding="6" Margin="0,0,0,8" Visibility="Collapsed">
+                    <StackPanel>
+                        <Label Content="5-Axis Sensor" FontWeight="Bold" FontSize="11" Foreground="White" Margin="0,0,0,4" Padding="0" HorizontalAlignment="Center" />
+                        <TextBlock x:Name="sensorAxisValuesLabel" Text="-" FontSize="10" Foreground="#00B7FF" FontFamily="Consolas" TextWrapping="NoWrap" />
                     </StackPanel>
-                </StackPanel>
-            </Border>
+                </Border>
+                <Border Background="#66000000" CornerRadius="4" Padding="6">
+                    <StackPanel>
+                        <Label Content="Key Legend" FontWeight="Bold" FontSize="11" Foreground="White" Margin="0,0,0,4" Padding="0" HorizontalAlignment="Center" />
+                        <Label Content="Position (Ctrl + Key):" FontSize="10"  Foreground="#F0F0F0" Margin="0" Padding="0" />
+                        <Label Content="  X: Left / Right" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                        <Label Content="  Y: Up / Down" FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                        <Label Content="  Z: Plus (+) / Minus (-)" FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
+                        <Label Content="Target (Shift + Key):" FontSize="10" Foreground="#F0F0F0" Margin="0" Padding="0" />
+                        <Label Content="  X: Left / Right" FontSize="10" Foreground="#DDDDDD" Margin="0" Padding="0" />
+                        <Label Content="  Y: Up / Down"  FontSize="10"  Foreground="#DDDDDD" Margin="0" Padding="0" />
+                        <Label Content="  Z: Plus (+) / Minus (-)"  FontSize="10" Foreground="#DDDDDD" Margin="0,0,0,4" Padding="0" />
+                        <Label Content="Field of View:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  O  /  o"  FontSize="10"  Foreground="#DDDDDD" Padding="0" />
+                        <Label Content="Keys:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Arrow Keys = Move Target" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  W + S = Back and Forth " FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  A + D = Left and Right" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Q + Z = Up and Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Home = Reset" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + F = Front View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + B = Back View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + L = Left View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + R = Right View" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + U = Up" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Ctrl + D = Down" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="Mouse:" FontSize="10" Foreground="#F0F0F0" Padding="0" />
+                        <Label Content="  Wheel = Zoom" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                        <Label Content="  Sh + R. Btn + Drag = Pan" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                        <Label Content="  R. Btn + Drag = Orbit" FontSize="10" Foreground="#DDDDDD" Padding="0" />
+                        <StackPanel Orientation="Horizontal">
+                            <Label Content=" X " Foreground="Cyan" />
+                            <Label Content=" Y " Foreground="Magenta" />
+                            <Label Content=" Z " Foreground="DarkGoldenrod" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
         </Grid>
         <StatusBar Grid.Row="3" Background="#E8E8E8" Padding="10">
             <TextBlock x:Name="statusLabel" Text="Ready" Foreground="#333333" FontSize="11" />

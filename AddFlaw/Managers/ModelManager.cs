@@ -13,6 +13,8 @@ namespace AddFlaw.Managers {
         private Color _color = Colors.Blue, _backColor = Colors.Green;              // Front/back base colors
         private Byte _emissionAlpha = 20;                                           // Emissive alpha component
         private Byte _baseAlpha = 255;                                              // Diffuse/base alpha component
+        private Boolean _wireframeMode;
+        private readonly ModelVisual3D _wireframeVisual = new();
         
         private readonly LinesVisual3D _xAxisVisual;
         private readonly LinesVisual3D _yAxisVisual;
@@ -23,6 +25,9 @@ namespace AddFlaw.Managers {
         private readonly ModelVisual3D _axisVisual;
         private Boolean _axisVisible = true;
         private Double _axisLength = 5; // change this value to set length of axis lines
+
+        private readonly record struct QuantizedPoint(Int64 X, Int64 Y, Int64 Z);
+        private readonly record struct WireEdgeKey(QuantizedPoint A, QuantizedPoint B);
 
         // Target sphere visualization
         private readonly SphereVisual3D _targetSphere;
@@ -136,8 +141,110 @@ namespace AddFlaw.Managers {
                 _ = _viewport.Children.Remove(ModelVisual);
                 ModelVisual.Content = model;
                 _viewport.Children.Add(ModelVisual);
+                RebuildWireframeVisual(model);
+                UpdateWireframeDisplay();
                 _viewport.ZoomExtents();
             }
+        }
+
+        public void SetWireframeMode(Boolean enabled_) {
+            _wireframeMode = enabled_;
+            UpdateWireframeDisplay();
+        }
+
+        private void UpdateWireframeDisplay() {
+            ApplyColor(ModelVisual.Content);
+            if (_wireframeMode) {
+                if (!_viewport.Children.Contains(_wireframeVisual))
+                    _viewport.Children.Add(_wireframeVisual);
+            } else {
+                _ = _viewport.Children.Remove(_wireframeVisual);
+            }
+        }
+
+        private void RebuildWireframeVisual(Model3D? model_) {
+            _wireframeVisual.Children.Clear();
+            if (model_ is null)
+                return;
+            AppendWireframeVisuals(model_, Matrix3D.Identity);
+        }
+
+        private void AppendWireframeVisuals(Model3D model_, Matrix3D parentTransform_) {
+            Matrix3D currentTransform = parentTransform_;
+            if (model_.Transform is not null) {
+                Matrix3D local = model_.Transform.Value;
+                if (!local.IsIdentity)
+                    currentTransform.Append(local);
+            }
+
+            if (model_ is Model3DGroup group) {
+                foreach (Model3D child in group.Children)
+                    AppendWireframeVisuals(child, currentTransform);
+                return;
+            }
+
+            if (model_ is not GeometryModel3D gm || gm.Geometry is not MeshGeometry3D mesh || mesh.Positions is null)
+                return;
+
+            Point3DCollection lines = [];
+            HashSet<WireEdgeKey> uniqueEdges = [];
+            Int32Collection? idx = mesh.TriangleIndices;
+            if (idx is { Count: >= 3 }) {
+                for (Int32 i = 0; i + 2 < idx.Count; i += 3) {
+                    Point3D a = mesh.Positions[idx[i]];
+                    Point3D b = mesh.Positions[idx[i + 1]];
+                    Point3D c = mesh.Positions[idx[i + 2]];
+                    a = currentTransform.Transform(a);
+                    b = currentTransform.Transform(b);
+                    c = currentTransform.Transform(c);
+                    AddUniqueWireEdge(lines, uniqueEdges, a, b);
+                    AddUniqueWireEdge(lines, uniqueEdges, b, c);
+                    AddUniqueWireEdge(lines, uniqueEdges, c, a);
+                }
+            } else {
+                for (Int32 i = 0; i + 2 < mesh.Positions.Count; i += 3) {
+                    Point3D a = currentTransform.Transform(mesh.Positions[i]);
+                    Point3D b = currentTransform.Transform(mesh.Positions[i + 1]);
+                    Point3D c = currentTransform.Transform(mesh.Positions[i + 2]);
+                    AddUniqueWireEdge(lines, uniqueEdges, a, b);
+                    AddUniqueWireEdge(lines, uniqueEdges, b, c);
+                    AddUniqueWireEdge(lines, uniqueEdges, c, a);
+                }
+            }
+
+            if (lines.Count == 0)
+                return;
+
+            _wireframeVisual.Children.Add(new LinesVisual3D {
+                Color = Colors.Black,
+                Thickness = 0.7,
+                Points = lines
+            });
+        }
+
+        private static void AddUniqueWireEdge(Point3DCollection lines_, HashSet<WireEdgeKey> uniqueEdges_, Point3D a_, Point3D b_) {
+            QuantizedPoint qa = QuantizePoint(a_);
+            QuantizedPoint qb = QuantizePoint(b_);
+            WireEdgeKey key = CompareQuantizedPoints(qa, qb) <= 0 ? new WireEdgeKey(qa, qb) : new WireEdgeKey(qb, qa);
+            if (!uniqueEdges_.Add(key))
+                return;
+            lines_.Add(a_);
+            lines_.Add(b_);
+        }
+
+        private static QuantizedPoint QuantizePoint(Point3D p_) {
+            const Double scale = 1_000_000.0;
+            return new QuantizedPoint(
+                (Int64)Math.Round(p_.X * scale),
+                (Int64)Math.Round(p_.Y * scale),
+                (Int64)Math.Round(p_.Z * scale));
+        }
+
+        private static Int32 CompareQuantizedPoints(QuantizedPoint a_, QuantizedPoint b_) {
+            if (a_.X != b_.X) return a_.X < b_.X ? -1 : 1;
+            if (a_.Y != b_.Y) return a_.Y < b_.Y ? -1 : 1;
+            if (a_.Z != b_.Z) return a_.Z < b_.Z ? -1 : 1;
+            return 0;
         }
 
         /// <summary>
@@ -177,13 +284,15 @@ namespace AddFlaw.Managers {
                     ApplyColor(child);
                 }
             } else if (model_ is GeometryModel3D geometry) {
+                Byte baseAlpha = _wireframeMode ? (Byte)0 : _baseAlpha;
+                Byte emissionAlpha = _wireframeMode ? (Byte)0 : _emissionAlpha;
                 MaterialGroup mg = new();
-                mg.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(_baseAlpha, _color.R, _color.G, _color.B))));
-                mg.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(_emissionAlpha, _color.R, _color.G, _color.B))));
+                mg.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(baseAlpha, _color.R, _color.G, _color.B))));
+                mg.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(emissionAlpha, _color.R, _color.G, _color.B))));
                 geometry.Material = mg;
                 mg = new MaterialGroup();
-                mg.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(_baseAlpha, _backColor.R, _backColor.G, _backColor.B))));
-                mg.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(_emissionAlpha, _backColor.R, _backColor.G, _backColor.B))));
+                mg.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(baseAlpha, _backColor.R, _backColor.G, _backColor.B))));
+                mg.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(emissionAlpha, _backColor.R, _backColor.G, _backColor.B))));
                 geometry.BackMaterial = mg;
             }
         }

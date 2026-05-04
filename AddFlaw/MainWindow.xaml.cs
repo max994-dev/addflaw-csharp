@@ -3,10 +3,12 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Media3D;
+using AddFlaw.Geometry;
 using AddFlaw.Managers;
 using AddFlaw.Models;
 using Microsoft.Win32;
 using Windows.UI.Input.Inking;
+using System.Globalization;
 using Color = System.Windows.Media.Color;
 using Path = System.IO.Path;
 using Point = System.Windows.Point;
@@ -21,12 +23,26 @@ namespace AddFlaw {
         private readonly FlawManager _flawManager;                                  // Manages flaw markers
         private readonly ViewportInteraction _viewportInteraction;                  // Handles camera and hit tests
         private readonly UIStateManager _uiStateManager;                            // Updates UI state/labels
+        private readonly TransitionRegionManager _transitionRegionManager;
+        private ModelPartScanner.ScanResult? _lastScan;
         private readonly Color[] _modelColors = [Colors.Blue, Colors.Gray];   // Available model colors
         private readonly Color[] _flawColors = [Colors.Red, Colors.Green];    // Available flaw colors
         private Boolean _waitEndPoint;                                              // Indicates awaiting 2nd point
         private Byte _emissionAlpha = 60;                                           // Current emissive alpha
         private Boolean _targetSphereGrowing = false;                                  // Target sphere render-loop state
         private DateTime _lastRenderTime = DateTime.MinValue;
+        private Point3D? _lineStartPoint;
+        private Point3D? _lineMiddlePoint;
+        private Point3D? _lineEndPoint;
+        private Int32 _linePickStep;
+        private Boolean _hasDrawnTransitionLine;
+        private Boolean _isLineDrawMode;
+        private Boolean _isLineDragging;
+        private DateTime _lastLineDrawAt = DateTime.MinValue;
+        private DateTime _lastLineMoveSampleAt = DateTime.MinValue;
+        private Point _lastLineMousePos = new(Double.NaN, Double.NaN);
+        private Boolean _lineDragAwaitMove;
+        private Boolean _showProbeEnabled;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="MainWindow"/> class and sets up the main application window.
@@ -39,6 +55,7 @@ namespace AddFlaw {
             _flawManager = new FlawManager(viewport3D);
             _viewportInteraction = new ViewportInteraction(viewport3D);
             _uiStateManager = new UIStateManager(addFlawButton, applyFlawLabelButton, statusLabel, flawsCountLabel, selectedFlawIdLabel, flawLabelTextBox);
+            _transitionRegionManager = new TransitionRegionManager(viewport3D);
             InitializeManagers();
             InitializeViewportEvents();
             CompositionTarget.Rendering += OnRendering;
@@ -50,7 +67,13 @@ namespace AddFlaw {
         private void InitializeManagers() {
             _emissionAlpha = (Byte)EmissionAlphaSlider.Value;
             EmissionAlphaLabel.Text = _emissionAlpha.ToString();
+            if (pointSpacingTextBox is not null) pointSpacingTextBox.Text = "0.1";
+            if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
+            _showProbeEnabled = false;
+            _transitionRegionManager.SetProbeEnabled(false);
         }
+
+        private static Double ParseDoubleOrDefault(String text_, Double def_) => Double.TryParse(text_, out Double v) ? v : def_;
 
         /// <summary>
         /// Subscribes to viewport interaction events.
@@ -70,6 +93,9 @@ namespace AddFlaw {
         /// <param name="evt_">Routed event args.</param>
         private void Viewport3D_LostFocus(Object sender_, RoutedEventArgs evt_) {
             _waitEndPoint = false;
+            _isLineDragging = false;
+            _lineDragAwaitMove = false;
+            _transitionRegionManager.EndLineDragSession();
             _flawManager.CancelFlaw();
         }
 
@@ -303,12 +329,191 @@ namespace AddFlaw {
                 try {
                     _modelManager.LoadModel(dialog.FileName);
                     _modelManager.SetModelColor(_modelColors[0]);
+                    _lastScan = null;
+                    _lineStartPoint = null;
+                    _lineMiddlePoint = null;
+                    _lineEndPoint = null;
+                    _linePickStep = 0;
+                    _hasDrawnTransitionLine = false;
+                    _isLineDrawMode = false;
+                    _isLineDragging = false;
+                    _lineDragAwaitMove = false;
+                    _transitionRegionManager.ClearTransitionCenterline();
+                    _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+                    if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
+                    UpdateDrawLineButtonState();
                     filePathLabel.Text = Path.GetFileName(dialog.FileName);
-                    _uiStateManager.SetStatus("Model loaded successfully");
+                    _uiStateManager.SetStatus("Model loaded. Turn on Draw Line, then click start, middle, and end points.");
                 } catch (Exception ex) {
                     _ = MessageBox.Show($"Error loading model: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     filePathLabel.Text = "Error loading file";
                 }
+            }
+        }
+        private void PointSpacingTextBox_LostFocus(Object sender_, RoutedEventArgs evt_) {
+            if (_lastScan is null || !_hasDrawnTransitionLine) return;
+            Double spacing = Math.Max(0.01, ParseDoubleOrDefault(pointSpacingTextBox?.Text ?? "0.1", 0.1));
+            if (_lineStartPoint is Point3D start && _lineMiddlePoint is Point3D middle && _lineEndPoint is Point3D end) {
+                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, middle, end);
+            }
+            UpdateSensorAxisDisplay();
+        }
+
+        private void SetPointSpacingButton_Click(Object sender_, RoutedEventArgs evt_) {
+            if (!_transitionRegionManager.TryGetDisplayedPointSpacing(out Double spacing)) {
+                _uiStateManager.SetStatus("No transition line points available to set spacing.");
+                return;
+            }
+
+            Double clamped = Math.Max(0.01, spacing);
+            pointSpacingTextBox.Text = clamped.ToString("0.###");
+            if (_lastScan is not null && _lineStartPoint is Point3D start && _lineMiddlePoint is Point3D middle && _lineEndPoint is Point3D end)
+                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, clamped, start, middle, end);
+            UpdateSensorAxisDisplay();
+            _uiStateManager.SetStatus($"Point spacing set to {clamped:0.###} in from line points.");
+        }
+
+        private Point3D GetCameraTargetPoint() {
+            if (viewport3D.Camera is ProjectionCamera cam)
+                return cam.Position + cam.LookDirection;
+            return new Point3D();
+        }
+
+        private Boolean HasLineOrControlSelection() =>
+            _hasDrawnTransitionLine || _lineStartPoint is not null || _lineMiddlePoint is not null || _lineEndPoint is not null;
+
+        private void DrawOneLineButton_Click(Object sender_, RoutedEventArgs evt_) {
+            if (_modelManager?.ModelVisual?.Content is null) {
+                _uiStateManager.SetStatus("Load a model first.");
+                return;
+            }
+            if (_isLineDrawMode && HasLineOrControlSelection()) {
+                _transitionRegionManager.ClearTransitionCenterline();
+                _lineStartPoint = null;
+                _lineMiddlePoint = null;
+                _lineEndPoint = null;
+                _linePickStep = 0;
+                _hasDrawnTransitionLine = false;
+                _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+                if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
+                UpdateDrawLineButtonState();
+                _uiStateManager.SetStatus("Cleared. Click start point.");
+                return;
+            }
+            _isLineDrawMode = !_isLineDrawMode;
+            if (!_isLineDrawMode)
+                _transitionRegionManager.EndLineDragSession();
+            else {
+                _lineStartPoint = null;
+                _lineMiddlePoint = null;
+                _lineEndPoint = null;
+                _linePickStep = 0;
+                _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+            }
+            UpdateDrawLineButtonState();
+            _uiStateManager.SetStatus(_isLineDrawMode
+                ? "Drawing mode ON: click start point, then middle point, then end point."
+                : "Drawing mode OFF.");
+        }
+
+        private void ShowProbeButton_Click(Object sender_, RoutedEventArgs evt_) {
+            _showProbeEnabled = !_showProbeEnabled;
+            _transitionRegionManager.SetProbeEnabled(_showProbeEnabled);
+            if (showProbeButton is not null) {
+                showProbeButton.Content = _showProbeEnabled ? "Show Probe: ON" : "Show Probe: OFF";
+                showProbeButton.Background = _showProbeEnabled
+                    ? new SolidColorBrush(Color.FromRgb(0x28, 0xA7, 0x45))
+                    : new SolidColorBrush(Color.FromRgb(0x6C, 0x75, 0x7D));
+            }
+            _uiStateManager.SetStatus(_showProbeEnabled
+                ? "Probe enabled. It will appear at the first sampled point when drawing."
+                : "Probe hidden.");
+        }
+
+        private void UpdateDrawLineButtonState() {
+            if (drawOneLineButton is null) return;
+            if (!_isLineDrawMode) {
+                drawOneLineButton.Content = "Draw Line";
+                drawOneLineButton.Background = new SolidColorBrush(Color.FromRgb(0x00, 0x78, 0xD4));
+                return;
+            }
+            if (HasLineOrControlSelection()) {
+                drawOneLineButton.Content = "Clear";
+                drawOneLineButton.Background = new SolidColorBrush(Color.FromRgb(0xD9, 0x53, 0x4F));
+                return;
+            }
+            drawOneLineButton.Content = "Drawing...";
+            drawOneLineButton.Background = new SolidColorBrush(Color.FromRgb(0x28, 0xA7, 0x45));
+        }
+
+        private Boolean TryDrawLineFromControlPoints(Boolean force_) {
+            if (_modelManager?.ModelVisual?.Content is null)
+                return false;
+            if (_lineStartPoint is not Point3D start || _lineMiddlePoint is not Point3D middle || _lineEndPoint is not Point3D end)
+                return false;
+            _lastScan ??= ModelPartScanner.Scan(_modelManager.ModelVisual.Content);
+            if (_lastScan.TotalTriangles == 0)
+                return false;
+            Double spacing = Math.Max(0.01, ParseDoubleOrDefault(pointSpacingTextBox?.Text ?? "0.1", 0.1));
+            DateTime now = DateTime.UtcNow;
+            if (!force_ && (now - _lastLineDrawAt).TotalMilliseconds < 12)
+                return false;
+            Boolean drawn = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, middle, end);
+            if (drawn) {
+                _hasDrawnTransitionLine = true;
+                _lastLineDrawAt = now;
+                UpdateSensorAxisDisplay();
+                UpdateDrawLineButtonState();
+            }
+            return drawn;
+        }
+
+        private void UpdateSensorAxisDisplay() {
+            if (sensorAxisValuesLabel is null) return;
+            IReadOnlyList<TransitionRegionManager.SensorAxisSample> axes = _transitionRegionManager.GetLastFiveAxisSamples();
+            if (axes.Count == 0) {
+                sensorAxisValuesLabel.Text = "-";
+                return;
+            }
+            TransitionRegionManager.SensorAxisSample a = axes[Math.Min(axes.Count - 1, 2)];
+            sensorAxisValuesLabel.Text =
+                $"X: {a.X.ToString("0.###", CultureInfo.InvariantCulture)}\n" +
+                $"Y: {a.Y.ToString("0.###", CultureInfo.InvariantCulture)}\n" +
+                $"Z: {a.Z.ToString("0.###", CultureInfo.InvariantCulture)}\n" +
+                $"A: {a.A.ToString("0.##", CultureInfo.InvariantCulture)} deg\n" +
+                $"B: {a.B.ToString("0.##", CultureInfo.InvariantCulture)} deg";
+        }
+
+        private void ExportSensorCsvButton_Click(Object sender_, RoutedEventArgs evt_) {
+            IReadOnlyList<TransitionRegionManager.SensorAxisSample> all = _transitionRegionManager.GetAllSensorAxisSamples();
+            if (all.Count == 0) {
+                _uiStateManager.SetStatus("No sensor points available to export.");
+                return;
+            }
+
+            SaveFileDialog dlg = new() {
+                Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*",
+                Title = "Export Sensor Axis Values",
+                FileName = "sensor-axis-values.csv"
+            };
+            if (dlg.ShowDialog() != true)
+                return;
+
+            try {
+                List<String> lines = ["Index,X,Y,Z,A_deg,B_deg"];
+                foreach (TransitionRegionManager.SensorAxisSample s in all) {
+                    lines.Add(String.Join(",",
+                        s.Index.ToString(CultureInfo.InvariantCulture),
+                        s.X.ToString("0.########", CultureInfo.InvariantCulture),
+                        s.Y.ToString("0.########", CultureInfo.InvariantCulture),
+                        s.Z.ToString("0.########", CultureInfo.InvariantCulture),
+                        s.A.ToString("0.######", CultureInfo.InvariantCulture),
+                        s.B.ToString("0.######", CultureInfo.InvariantCulture)));
+                }
+                System.IO.File.WriteAllLines(dlg.FileName, lines);
+                _uiStateManager.SetStatus($"Exported {all.Count} sensor points to CSV.");
+            } catch (Exception ex) {
+                _ = MessageBox.Show($"Error exporting sensor CSV: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
@@ -390,6 +595,10 @@ namespace AddFlaw {
         private void ShowAxisCheckBox_Checked(Object sender_, RoutedEventArgs evt_) => _modelManager?.ShowAxisLines(true);
 
         private void ShowAxisCheckBox_Unchecked(Object sender_, RoutedEventArgs evt_) => _modelManager?.ShowAxisLines(false);
+
+        private void WireframeCheckBox_Checked(Object sender_, RoutedEventArgs evt_) => _modelManager?.SetWireframeMode(true);
+
+        private void WireframeCheckBox_Unchecked(Object sender_, RoutedEventArgs evt_) => _modelManager?.SetWireframeMode(false);
 
         /// <summary>
         /// Handles keyboard shortcuts for camera movement, FOV, and flaw placement cancellation.
@@ -558,6 +767,40 @@ namespace AddFlaw {
         private void Viewport3D_MouseDown(Object sender_, MouseButtonEventArgs evt_) {
             if (evt_.LeftButton != MouseButtonState.Pressed) return;
             Point mousePos = evt_.GetPosition(viewport3D.Viewport);
+            if (_isLineDrawMode) {
+                if (_hasDrawnTransitionLine) {
+                    evt_.Handled = true;
+                    return;
+                }
+                (Boolean modelHit, Point3D? hitPoint) = _viewportInteraction.Get3DPointInModel(mousePos, _modelManager);
+                if (modelHit && hitPoint is not null) {
+                    if (_linePickStep == 0) {
+                        _lineStartPoint = hitPoint.Value;
+                        _linePickStep = 1;
+                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
+                        UpdateDrawLineButtonState();
+                        _uiStateManager.SetStatus("Start point selected. Click middle point.");
+                    } else if (_linePickStep == 1) {
+                        _lineMiddlePoint = hitPoint.Value;
+                        _linePickStep = 2;
+                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
+                        UpdateDrawLineButtonState();
+                        _uiStateManager.SetStatus("Middle point selected. Click end point.");
+                    } else {
+                        _lineEndPoint = hitPoint.Value;
+                        _linePickStep = 3;
+                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
+                        Boolean drawn = TryDrawLineFromControlPoints(true);
+                        if (!drawn)
+                            UpdateDrawLineButtonState();
+                        _uiStateManager.SetStatus(drawn
+                            ? "Line drawn from middle toward start/end. Click Clear to try again."
+                            : "Failed to draw path. Click Clear, then pick start / middle / end again.");
+                    }
+                    evt_.Handled = true;
+                }
+                return;
+            }
             _flawManager.DeselectFlaw();
             if (_uiStateManager.IsAddingFlaw) {   // in the adding flaw mode
                 (Boolean modelHit, Point3D? hitPoint) = _viewportInteraction.Get3DPointInModel(mousePos, _modelManager);
@@ -649,7 +892,11 @@ namespace AddFlaw {
         /// <param name="sender_">Event sender.</param>
         /// <param name="evt_">Mouse event args.</param>
         private void Viewport3D_MouseUp(Object sender_, MouseButtonEventArgs evt_) {
-
+            if (evt_.LeftButton == MouseButtonState.Released) {
+                _isLineDragging = false;
+                _lineDragAwaitMove = false;
+                _transitionRegionManager.EndLineDragSession();
+            }
         }
 
         /// <summary>
