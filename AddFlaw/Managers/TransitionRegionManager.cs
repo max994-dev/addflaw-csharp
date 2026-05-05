@@ -395,22 +395,20 @@ namespace AddFlaw.Managers {
             if (tris.Count < 1)
                 return false;
 
-            // Build [startClick, center(t0), center(t1), ..., center(tN), endClick] so the visible
-            // line literally begins/ends at the user's click positions, not at triangle centroids.
-            centers_ = new List<Point3D>(tris.Count + 2);
-            normals_ = new List<Vector3D>(tris.Count + 2);
-            centers_.Add(startPoint_);
-            normals_.Add(scan_.TriNormals[startTri]);
+            // Build [center(t0), center(t1), ..., center(tN)] from triangle centroids only.
+            // The user's start/end click positions are used solely to locate the nearest triangle;
+            // they are NOT inserted as path points because they may lie off the actual surface curve.
+            centers_ = new List<Point3D>(tris.Count);
+            normals_ = new List<Vector3D>(tris.Count);
             for (Int32 i = 0; i < tris.Count; i++) {
                 centers_.Add(scan_.TriCenters[tris[i]]);
                 normals_.Add(scan_.TriNormals[tris[i]]);
             }
-            centers_.Add(endPoint_);
-            normals_.Add(scan_.TriNormals[endTri]);
 
-            // The midTri centroid sits at index (1 + a.Count - 1) = a.Count in the centers_ layout.
-            // Replace it with the user's middle-click point so the path is pinned at all 3 controls.
-            Int32 midIdx = a.Count;
+            // midTri is at index a.Count - 1 in the all-centroid layout (a[^1] = midTri).
+            // Replace it with the user's middle-click point so the path still passes through that
+            // orientation anchor (the middle click is an intentional waypoint, not just a hint).
+            Int32 midIdx = a.Count - 1;
             if (midIdx > 0 && midIdx < centers_.Count - 1) {
                 centers_[midIdx] = middlePoint_;
                 middleAnchorIndex_ = midIdx;
@@ -505,9 +503,11 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// Take the unsampled anchored centroid polyline (with click anchors pinned at start, middle,
-        /// end), smooth it without dragging the anchors, resample at uniform spacing, lift each
-        /// sample off the surface, and update the visuals + sensor axis tables.
+        /// Take the unsampled anchored centroid polyline (with the middle click pinned as waypoint),
+        /// smooth it without dragging the anchors, resample at uniform spacing, lift each sample off
+        /// the surface, and update the visuals + sensor axis tables. The start/end triangle centroids
+        /// are the natural endpoints; the user's start/end click positions are not inserted into the
+        /// arc center path.
         /// </summary>
         private Boolean DrawFromAnchoredCurve(
             ModelPartScanner.ScanResult scan_,
@@ -525,7 +525,8 @@ namespace AddFlaw.Managers {
                 _ = pinned.Add(middleAnchorIndex_);
 
             // Light smoothing that pins the anchor indices in place: the line stays anchored to the
-            // user's clicks while still removing the worst centroid-to-centroid staircasing.
+            // middle waypoint and keeps its natural centroid-derived endpoints while still removing
+            // the worst centroid-to-centroid staircasing.
             Int32 smoothRadius = Math.Clamp(centers_.Count / 18, 1, 3);
             List<Point3D> smoothed = SmoothPathPreservingPinned(centers_, smoothRadius, pinned);
             smoothed = SmoothPathPreservingPinned(smoothed, smoothRadius, pinned);
@@ -533,11 +534,6 @@ namespace AddFlaw.Managers {
             if (!TryResamplePathWithSegments(smoothed, spacing, out List<Point3D>? samples, out List<(Int32 seg, Double t)>? sampleSeg) ||
                 samples is null || sampleSeg is null || samples.Count < 2)
                 return false;
-
-            // Re-pin endpoints exactly: smoothing/resampling rounding must not nudge the visible
-            // line off the clicked start/end positions.
-            samples[0] = centers_[0];
-            samples[^1] = centers_[^1];
 
             // Per-sample probe normal: linearly interpolate between the two centroid normals that
             // bracket the sample's arc-length position, then re-normalize. This eliminates the
