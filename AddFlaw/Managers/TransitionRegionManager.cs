@@ -563,23 +563,18 @@ namespace AddFlaw.Managers {
             Double lift = Math.Max(0.0002, diag * 0.00003);
             Double minClearance = Math.Max(lift * 1.5, diag * 0.00008);
 
-            // Per-sample local-arc fit BEFORE the lift mutates `samples`. The arc center is a property
-            // of the on-surface fillet, not of the lifted probe position, so we use the raw resampled
-            // points + the interpolated mesh normals here. The fit runs in 2 passes (initial Kasa fit,
-            // then refit after dropping points outside [0.55R, 1.45R] of the first center) to shed
-            // straggler triangles that survive the curvy filter near the ends of the fillet.
+            // Per-sample local-arc fit BEFORE the lift mutates `samples`. The arc center is a
+            // property of the on-surface fillet, not of the lifted probe position, so we use the
+            // raw resampled points + the interpolated mesh normals here.
             List<Point3D> surfaceSamples = new(samples);
             _lastArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
-            // Local outlier pass: reject samples whose center sits far from the local mean of its
-            // neighbours' centers. Catches single-sample spikes before the global polynomial fit.
-            _lastArcSamples = RejectArcCenterOutliers(_lastArcSamples, halfWindow_: 5, maxLateralRatio_: 0.6);
-            // Global polynomial fit: cubic in arc-length-along-path with iterative reweighting so
-            // a contiguous run of wrong-direction samples at the start/end (which the local
-            // outlier check can't catch -- they all "agree" with each other) gets demoted by
-            // residual against the global trend. The displayed curve is sampled from the fitted
-            // polynomial only inside the inlier arc-length range, so the endpoints can't go off
-            // in the wrong direction even when the raw fit there was bad.
-            _lastArcSamples = FitSmoothArcCenterCurve(_lastArcSamples, spacing);
+            // The arc-center path is the sensor path translated by a single offset vector; this
+            // guarantees identical shape (so it inherits the sensor path's smoothness and stays a
+            // single convex curve) and avoids the per-sample noise that was visible before. The
+            // offset is the per-component median of (arc_center - sensor_sample) over all valid
+            // per-sample fits -- per-component median is a 50%-breakdown estimator, so wrong-
+            // direction outliers at the ends or sporadic bad fits don't bias it.
+            Vector3D arcCenterOffset = ComputeMedianArcCenterOffset(_lastArcSamples, surfaceSamples);
 
             List<Vector3D> outDirs = new(samples.Count);
             for (Int32 i = 0; i < samples.Count; i++) {
@@ -621,27 +616,52 @@ namespace AddFlaw.Managers {
             _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
             _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
 
-            // Arc visuals: only the smoothed arc-center polyline is drawn. The per-sample dots and
-            // the radii lines are intentionally left blank (the user wants a clean curve, not a
-            // point cloud with vertical lines).
+            // Arc-center path: sensor path translated by the global median offset vector. Same
+            // shape, same smoothness as the sensor path (which is the user's expectation -- a
+            // single convex curve, not a per-sample fit). The per-sample dots and radii lines are
+            // intentionally left blank.
             Point3DCollection arcCenterPath = [];
-            Point3D? prevCenter = null;
-            for (Int32 i = 0; i < _lastArcSamples.Count && i < samples.Count; i++) {
-                SensorArcSample arc = _lastArcSamples[i];
-                if (!arc.Valid || arc.Center is not Point3D c) {
-                    prevCenter = null;
-                    continue;
-                }
-                if (prevCenter is Point3D pc) {
-                    arcCenterPath.Add(pc);
-                    arcCenterPath.Add(c);
-                }
-                prevCenter = c;
+            if (arcCenterOffset.LengthSquared > 1e-18 && samples.Count >= 2) {
+                List<Point3D> arcPts = new(samples.Count);
+                for (Int32 i = 0; i < samples.Count; i++) arcPts.Add(samples[i] + arcCenterOffset);
+                AddPolylineAsSegments(arcCenterPath, arcPts);
+                // Overwrite the cached per-sample arc samples so CSV export and any downstream
+                // consumers see the smoothed translated curve, not the noisy per-sample cloud.
+                List<SensorArcSample> translated = new(samples.Count);
+                Double radius = arcCenterOffset.Length;
+                for (Int32 i = 0; i < samples.Count; i++)
+                    translated.Add(new SensorArcSample(i + 1, samples[i] + arcCenterOffset, radius, true));
+                _lastArcSamples = translated;
+            } else {
+                _lastArcSamples = [];
             }
             _arcCenterVisual.Points = [];
             _arcRadiusVisual.Points = [];
             _arcCenterPathVisual.Points = arcCenterPath;
             return lineSegments.Count >= 2;
+        }
+
+        /// <summary>
+        /// Per-component (X, Y, Z) median of (arc_center - sensor_sample) across all valid arc
+        /// fits. Per-component median is a 50% breakdown estimator: as long as fewer than half of
+        /// the samples have a wrong-direction fit, the result is the median translation that maps
+        /// the sensor path onto the cloud of fitted arc centers. Returns the zero vector when
+        /// there are no valid fits.
+        /// </summary>
+        private static Vector3D ComputeMedianArcCenterOffset(IReadOnlyList<SensorArcSample> arcSamples_, IReadOnlyList<Point3D> sensorSamples_) {
+            Int32 n = arcSamples_.Count;
+            if (n == 0 || sensorSamples_.Count != n) return new Vector3D(0, 0, 0);
+            List<Double> dxs = new(n), dys = new(n), dzs = new(n);
+            for (Int32 i = 0; i < n; i++) {
+                SensorArcSample sa = arcSamples_[i];
+                if (!sa.Valid || sa.Center is not Point3D ci) continue;
+                Vector3D d = ci - sensorSamples_[i];
+                dxs.Add(d.X); dys.Add(d.Y); dzs.Add(d.Z);
+            }
+            if (dxs.Count == 0) return new Vector3D(0, 0, 0);
+            dxs.Sort(); dys.Sort(); dzs.Sort();
+            Int32 mid = dxs.Count / 2;
+            return new Vector3D(dxs[mid], dys[mid], dzs[mid]);
         }
 
         /// <summary>
@@ -847,279 +867,6 @@ namespace AddFlaw.Managers {
                 result.Add(new SensorArcSample(i + 1, center3d, r, true));
             }
             return result;
-        }
-
-        /// <summary>
-        /// One-shot smooth-curve fit through the per-sample arc centers, treating them as a
-        /// cubic-polynomial curve in (x, y, z) parameterised by arc-length along the sensor path.
-        /// Iteratively reweights to demote wrong-direction outliers (typically clusters at the
-        /// path endpoints where the local cross-section degenerates) and only emits centers
-        /// inside the inlier arc-length range -- no extrapolation past where the data supports it.
-        /// The result is a single smooth, near-convex curve that follows the bulk of the centers.
-        /// </summary>
-        private static List<SensorArcSample> FitSmoothArcCenterCurve(IReadOnlyList<SensorArcSample> samples_, Double spacingInch_) {
-            Int32 n = samples_.Count;
-            List<SensorArcSample> result = new(n);
-            List<Double> ss = new(n);
-            List<Double> xs = new(n);
-            List<Double> ys = new(n);
-            List<Double> zs = new(n);
-            List<Double> rs = new(n);
-            for (Int32 i = 0; i < n; i++) {
-                SensorArcSample sa = samples_[i];
-                if (!sa.Valid || sa.Center is not Point3D ci) continue;
-                ss.Add(i * spacingInch_);
-                xs.Add(ci.X);
-                ys.Add(ci.Y);
-                zs.Add(ci.Z);
-                rs.Add(sa.Radius);
-            }
-            Int32 nValid = ss.Count;
-            // Need enough valid samples to fit a cubic. Fall back to a simple moving-average
-            // smoothing pass when there are too few -- better than crashing back to no smoothing.
-            if (nValid < 12) {
-                return SmoothArcSamplesAlongPath(samples_, halfWindow_: 4);
-            }
-            Int32 degree = 3;
-
-            Boolean[] keep = new Boolean[nValid];
-            for (Int32 i = 0; i < nValid; i++) keep[i] = true;
-            // Hard-trim a fixed margin from each end of the valid run before fitting. Endpoint
-            // samples consistently sit on transitions where the path leaves the fillet onto an
-            // edge or flat surface; their per-sample fits systematically point in the wrong
-            // direction. Iterative reweighting alone can't catch them because the cubic happily
-            // bends to fit them, so we drop them up front.
-            Int32 endTrim = Math.Max(8, nValid / 8);
-            endTrim = Math.Min(endTrim, (nValid - 6) / 2); // leave at least 6 in the middle
-            for (Int32 i = 0; i < endTrim; i++) keep[i] = false;
-            for (Int32 i = nValid - endTrim; i < nValid; i++) keep[i] = false;
-            Int32 keepCount = nValid - (2 * endTrim);
-            Int32 minKeep = Math.Max(degree + 2, (nValid * 4) / 10);
-            PolyFit cx = default, cy = default, cz = default, cr = default;
-            for (Int32 iter = 0; iter < 4; iter++) {
-                List<Double> sk = new(keepCount), xk = new(keepCount), yk = new(keepCount), zk = new(keepCount), rk = new(keepCount);
-                for (Int32 i = 0; i < nValid; i++) {
-                    if (!keep[i]) continue;
-                    sk.Add(ss[i]); xk.Add(xs[i]); yk.Add(ys[i]); zk.Add(zs[i]); rk.Add(rs[i]);
-                }
-                if (sk.Count < degree + 1) break;
-                if (!TryFitPolynomial(sk, xk, degree, out cx)) break;
-                if (!TryFitPolynomial(sk, yk, degree, out cy)) break;
-                if (!TryFitPolynomial(sk, zk, degree, out cz)) break;
-                if (!TryFitPolynomial(sk, rk, degree, out cr)) break;
-                Double[] residuals = new Double[nValid];
-                List<Double> resSorted = new(nValid);
-                for (Int32 i = 0; i < nValid; i++) {
-                    Double dx = cx.Eval(ss[i]) - xs[i];
-                    Double dy = cy.Eval(ss[i]) - ys[i];
-                    Double dz = cz.Eval(ss[i]) - zs[i];
-                    Double res = Math.Sqrt((dx * dx) + (dy * dy) + (dz * dz));
-                    residuals[i] = res;
-                    if (keep[i]) resSorted.Add(res);
-                }
-                if (resSorted.Count == 0) break;
-                resSorted.Sort();
-                Double median = resSorted[resSorted.Count / 2];
-                Double meanR = 0;
-                for (Int32 i = 0; i < nValid; i++) meanR += rs[i];
-                meanR /= nValid;
-                Double tol = Math.Max(median * 2.0, meanR * 0.03);
-                Int32 newKeep = 0;
-                Boolean changed = false;
-                for (Int32 i = 0; i < nValid; i++) {
-                    Boolean k = residuals[i] <= tol;
-                    if (k != keep[i]) changed = true;
-                    keep[i] = k;
-                    if (k) newKeep++;
-                }
-                keepCount = newKeep;
-                if (newKeep < minKeep) break;
-                if (!changed) break;
-            }
-
-            Double sMinKept = Double.MaxValue, sMaxKept = Double.MinValue;
-            for (Int32 i = 0; i < nValid; i++) {
-                if (!keep[i]) continue;
-                if (ss[i] < sMinKept) sMinKept = ss[i];
-                if (ss[i] > sMaxKept) sMaxKept = ss[i];
-            }
-            if (sMinKept >= sMaxKept) {
-                return SmoothArcSamplesAlongPath(samples_, halfWindow_: 4);
-            }
-
-            for (Int32 i = 0; i < n; i++) {
-                Double s = i * spacingInch_;
-                if (s < sMinKept || s > sMaxKept) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-                Point3D c = new(cx.Eval(s), cy.Eval(s), cz.Eval(s));
-                Double r = Math.Max(0, cr.Eval(s));
-                result.Add(new SensorArcSample(i + 1, c, r, true));
-            }
-            return result;
-        }
-
-        /// <summary>
-        /// 1-D polynomial of degree d, stored centered at sMean for numerical conditioning:
-        /// p(s) = sum_k Coefs[k] * (s - SMean)^k.
-        /// </summary>
-        private readonly struct PolyFit {
-            public Double[] Coefs { get; }
-            public Double SMean { get; }
-            public PolyFit(Double[] coefs_, Double sMean_) { Coefs = coefs_; SMean = sMean_; }
-            public Double Eval(Double s_) {
-                if (Coefs is null || Coefs.Length == 0) return 0;
-                Double u = s_ - SMean;
-                Double y = 0;
-                Double up = 1;
-                for (Int32 i = 0; i < Coefs.Length; i++) {
-                    y += Coefs[i] * up;
-                    up *= u;
-                }
-                return y;
-            }
-        }
-
-        private static Boolean TryFitPolynomial(IReadOnlyList<Double> s_, IReadOnlyList<Double> y_, Int32 degree_, out PolyFit fit_) {
-            fit_ = default;
-            Int32 n = s_.Count;
-            Int32 d = degree_ + 1;
-            if (n < d || y_.Count != n) return false;
-            Double sMean = 0;
-            for (Int32 i = 0; i < n; i++) sMean += s_[i];
-            sMean /= n;
-            Double[,] AtA = new Double[d, d];
-            Double[] Aty = new Double[d];
-            Double[] powers = new Double[d];
-            for (Int32 i = 0; i < n; i++) {
-                Double u = s_[i] - sMean;
-                powers[0] = 1.0;
-                for (Int32 k = 1; k < d; k++) powers[k] = powers[k - 1] * u;
-                for (Int32 j = 0; j < d; j++) {
-                    for (Int32 k = 0; k < d; k++) AtA[j, k] += powers[j] * powers[k];
-                    Aty[j] += powers[j] * y_[i];
-                }
-            }
-            if (!SolveLinearSystem(AtA, Aty, out Double[] sol)) return false;
-            fit_ = new PolyFit(sol, sMean);
-            return true;
-        }
-
-        private static Boolean SolveLinearSystem(Double[,] m_, Double[] b_, out Double[] x_) {
-            Int32 n = b_.Length;
-            x_ = new Double[n];
-            Double[,] M = new Double[n, n + 1];
-            for (Int32 i = 0; i < n; i++) {
-                for (Int32 j = 0; j < n; j++) M[i, j] = m_[i, j];
-                M[i, n] = b_[i];
-            }
-            for (Int32 i = 0; i < n; i++) {
-                Int32 maxRow = i;
-                Double maxVal = Math.Abs(M[i, i]);
-                for (Int32 k = i + 1; k < n; k++) {
-                    Double v = Math.Abs(M[k, i]);
-                    if (v > maxVal) { maxVal = v; maxRow = k; }
-                }
-                if (maxVal < 1e-14) return false;
-                if (maxRow != i) {
-                    for (Int32 j = i; j <= n; j++) (M[i, j], M[maxRow, j]) = (M[maxRow, j], M[i, j]);
-                }
-                for (Int32 k = i + 1; k < n; k++) {
-                    Double f = M[k, i] / M[i, i];
-                    for (Int32 j = i; j <= n; j++) M[k, j] -= f * M[i, j];
-                }
-            }
-            for (Int32 i = n - 1; i >= 0; i--) {
-                Double s = M[i, n];
-                for (Int32 j = i + 1; j < n; j++) s -= M[i, j] * x_[j];
-                x_[i] = s / M[i, i];
-            }
-            return true;
-        }
-
-        /// <summary>
-        /// Reject per-sample arc fits whose center sits far from the local trend of its
-        /// neighbours' centers. For each valid sample i we compute the mean center over
-        /// [i - halfWindow, i + halfWindow] excluding i itself; if the actual center for i is
-        /// more than maxLateralRatio_ * R_avg away from that mean, the sample is marked invalid.
-        /// Catches the "wrong-direction" centers that appear at the start/end of a path where the
-        /// cross-section transitions out of the fillet onto a flat or edge region.
-        /// </summary>
-        private static List<SensorArcSample> RejectArcCenterOutliers(IReadOnlyList<SensorArcSample> samples_, Int32 halfWindow_, Double maxLateralRatio_) {
-            Int32 n = samples_.Count;
-            List<SensorArcSample> outList = new(n);
-            if (n == 0) return outList;
-            Int32 hw = Math.Max(1, halfWindow_);
-            for (Int32 i = 0; i < n; i++) {
-                SensorArcSample s = samples_[i];
-                if (!s.Valid || s.Center is not Point3D ci) {
-                    outList.Add(s);
-                    continue;
-                }
-                Double sx = 0, sy = 0, sz = 0, sr = 0;
-                Int32 cnt = 0;
-                Int32 lo = Math.Max(0, i - hw);
-                Int32 hi = Math.Min(n - 1, i + hw);
-                for (Int32 j = lo; j <= hi; j++) {
-                    if (j == i) continue;
-                    SensorArcSample sj = samples_[j];
-                    if (!sj.Valid || sj.Center is not Point3D cj) continue;
-                    sx += cj.X; sy += cj.Y; sz += cj.Z; sr += sj.Radius;
-                    cnt++;
-                }
-                if (cnt < 2) {
-                    outList.Add(s);
-                    continue;
-                }
-                Point3D mean = new(sx / cnt, sy / cnt, sz / cnt);
-                Double meanR = sr / cnt;
-                Double tol = Math.Max(s.Radius, meanR) * maxLateralRatio_;
-                if ((ci - mean).Length > tol) {
-                    outList.Add(new SensorArcSample(s.Index, null, 0, false));
-                } else {
-                    outList.Add(s);
-                }
-            }
-            return outList;
-        }
-
-        /// <summary>
-        /// Moving-average smoothing of arc-center samples along the path. For each valid sample i,
-        /// average the centers (and radii) of the valid samples in [i - halfWindow, i + halfWindow].
-        /// Invalid samples are skipped (they break the window so a gap doesn't drag the smoothed
-        /// curve across unrelated regions). Output preserves the same Index, Valid, and per-slot
-        /// alignment as the input.
-        /// </summary>
-        private static List<SensorArcSample> SmoothArcSamplesAlongPath(IReadOnlyList<SensorArcSample> samples_, Int32 halfWindow_) {
-            Int32 n = samples_.Count;
-            List<SensorArcSample> outList = new(n);
-            if (n == 0) return outList;
-            Int32 hw = Math.Max(0, halfWindow_);
-            for (Int32 i = 0; i < n; i++) {
-                SensorArcSample s = samples_[i];
-                if (!s.Valid || s.Center is not Point3D) {
-                    outList.Add(s);
-                    continue;
-                }
-                Double sx = 0, sy = 0, sz = 0, sr = 0;
-                Int32 count = 0;
-                Int32 lo = Math.Max(0, i - hw);
-                Int32 hi = Math.Min(n - 1, i + hw);
-                for (Int32 j = lo; j <= hi; j++) {
-                    SensorArcSample sj = samples_[j];
-                    if (!sj.Valid || sj.Center is not Point3D pj) continue;
-                    sx += pj.X; sy += pj.Y; sz += pj.Z; sr += sj.Radius;
-                    count++;
-                }
-                if (count == 0) {
-                    outList.Add(s);
-                    continue;
-                }
-                Point3D avg = new(sx / count, sy / count, sz / count);
-                outList.Add(new SensorArcSample(s.Index, avg, sr / count, true));
-            }
-            return outList;
         }
 
         /// <summary>
