@@ -585,10 +585,36 @@ namespace AddFlaw.Managers {
             if (sensorPositions.Count < 2) return false;
             outDirs = filteredOutDirs;
 
-            // Aggressive multi-pass smoothing to turn the noisy per-cross-section arc midpoints
-            // into a single smooth convex line. No endpoint pinning: the natural arc endpoints
-            // (where the fillet transitions to flat surface) should converge, not be anchored
-            // to guide-path triangle centroids which may be in the wrong region.
+            // Sort arc midpoints monotonically by their projection along the overall
+            // start→end direction. Raw cross-section samples can be out of order when
+            // adjacent guide-path stations pick from opposite ends of the arc, which
+            // would produce zigzags that no amount of smoothing can fix. Sorting first
+            // guarantees the path progresses consistently from start to end.
+            if (sensorPositions.Count >= 3) {
+                Vector3D mainDir = sensorPositions[^1] - sensorPositions[0];
+                if (mainDir.LengthSquared > 1e-18) {
+                    mainDir.Normalize();
+                    Point3D origin = sensorPositions[0];
+                    Double[] proj = new Double[sensorPositions.Count];
+                    Int32[] sortIdx = new Int32[sensorPositions.Count];
+                    for (Int32 i = 0; i < sensorPositions.Count; i++) {
+                        proj[i] = Vector3D.DotProduct(sensorPositions[i] - origin, mainDir);
+                        sortIdx[i] = i;
+                    }
+                    Array.Sort(proj, sortIdx);
+                    List<Point3D> sortedPos = new(sensorPositions.Count);
+                    List<Vector3D> sortedDirs = new(sensorPositions.Count);
+                    foreach (Int32 idx in sortIdx) {
+                        sortedPos.Add(sensorPositions[idx]);
+                        sortedDirs.Add(outDirs[idx]);
+                    }
+                    sensorPositions = sortedPos;
+                    outDirs = sortedDirs;
+                }
+            }
+
+            // Aggressive multi-pass smoothing to produce a single smooth convex line.
+            // The sort above ensures no backtracking; smoothing removes cross-section noise.
             Int32 arcSmooth = Math.Clamp(sensorPositions.Count / 5, 2, 10);
             for (Int32 pass = 0; pass < 4; pass++)
                 sensorPositions = SmoothPathPreservingPinned(sensorPositions, arcSmooth, new HashSet<Int32>());
@@ -838,11 +864,27 @@ namespace AddFlaw.Managers {
                     continue;
                 }
 
-                // Arc midpoint: the actual cross-section point at the median angular position
-                // in the arc segment. This point came from a mesh-edge intersection, so it
-                // lies exactly ON the fillet surface -- not offset from it.
+                // True angular midpoint of the arc: the cross-section point whose angle
+                // (relative to the Kasa center) is closest to (θ_start + θ_end) / 2.
+                // "Median index" is wrong when cross-section points cluster unevenly along
+                // the arc -- the angular midpoint is independent of point density.
                 Int32 arcStartSorted = (gapAfterSorted + 1) % nPts;
-                (Double mx, Double my) = cs[order[(arcStartSorted + (nPts / 2)) % nPts]];
+                Double thetaArcStart = theta[arcStartSorted];
+                Double thetaArcEnd = theta[gapAfterSorted];
+                // Adjust for wrap-around through the ±π boundary.
+                if (thetaArcEnd < thetaArcStart) thetaArcEnd += 2.0 * Math.PI;
+                Double thetaMid = (thetaArcStart + thetaArcEnd) * 0.5;
+
+                Int32 bestSortedIdx = arcStartSorted;
+                Double bestAngDiff = Double.MaxValue;
+                for (Int32 j = 0; j < nPts; j++) {
+                    Int32 sIdx = (arcStartSorted + j) % nPts;
+                    Double ang = theta[sIdx];
+                    if (ang < thetaArcStart - 0.01) ang += 2.0 * Math.PI;
+                    Double diff = Math.Abs(ang - thetaMid);
+                    if (diff < bestAngDiff) { bestAngDiff = diff; bestSortedIdx = sIdx; }
+                }
+                (Double mx, Double my) = cs[order[bestSortedIdx]];
                 Point3D arcMid3D = P + (B * mx) + (N2 * my);
                 result.Add(new SensorArcSample(i + 1, arcMid3D, 0, true));
             }
