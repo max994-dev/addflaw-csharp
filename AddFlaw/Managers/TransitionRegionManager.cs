@@ -570,17 +570,16 @@ namespace AddFlaw.Managers {
             // straggler triangles that survive the curvy filter near the ends of the fillet.
             List<Point3D> surfaceSamples = new(samples);
             _lastArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
-            // Outlier pass: reject samples whose center sits far from the local mean of its
-            // neighbours' centers. Two passes so a contiguous run of bad samples (typically at the
-            // start/end of the path where the cross-section transitions onto a flat surface or
-            // an edge) gets fully removed instead of dragging the smoothed curve in the wrong
-            // direction.
+            // Local outlier pass: reject samples whose center sits far from the local mean of its
+            // neighbours' centers. Catches single-sample spikes before the global polynomial fit.
             _lastArcSamples = RejectArcCenterOutliers(_lastArcSamples, halfWindow_: 5, maxLateralRatio_: 0.6);
-            _lastArcSamples = RejectArcCenterOutliers(_lastArcSamples, halfWindow_: 5, maxLateralRatio_: 0.6);
-            // Two smoothing passes (half-window 4 each) -- equivalent to a wider Gaussian than a
-            // single moving average, with much less ringing than a single half-window-8 pass.
-            _lastArcSamples = SmoothArcSamplesAlongPath(_lastArcSamples, halfWindow_: 4);
-            _lastArcSamples = SmoothArcSamplesAlongPath(_lastArcSamples, halfWindow_: 4);
+            // Global polynomial fit: cubic in arc-length-along-path with iterative reweighting so
+            // a contiguous run of wrong-direction samples at the start/end (which the local
+            // outlier check can't catch -- they all "agree" with each other) gets demoted by
+            // residual against the global trend. The displayed curve is sampled from the fitted
+            // polynomial only inside the inlier arc-length range, so the endpoints can't go off
+            // in the wrong direction even when the raw fit there was bad.
+            _lastArcSamples = FitSmoothArcCenterCurve(_lastArcSamples, spacing);
 
             List<Vector3D> outDirs = new(samples.Count);
             for (Int32 i = 0; i < samples.Count; i++) {
@@ -827,6 +826,17 @@ namespace AddFlaw.Managers {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
+                // Side check: for a concave fillet the center lies on the *outward* side of the
+                // surface, i.e. positive b in the (B, N2) frame where N2 is aligned with the
+                // outward normal. Allow a small negative tolerance for numerical noise but reject
+                // fits that lock onto a fundamentally convex cross-section -- those are typically
+                // produced at the path endpoints where the fillet transitions onto an edge or
+                // a flat surface and would otherwise drag the smoothed centerline in the wrong
+                // direction.
+                if (b < -r * 0.05) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
                 Double residual = MeanCircleResidual(cs, a, b, r);
                 if (residual > r * 0.20) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
@@ -837,6 +847,185 @@ namespace AddFlaw.Managers {
                 result.Add(new SensorArcSample(i + 1, center3d, r, true));
             }
             return result;
+        }
+
+        /// <summary>
+        /// One-shot smooth-curve fit through the per-sample arc centers, treating them as a
+        /// cubic-polynomial curve in (x, y, z) parameterised by arc-length along the sensor path.
+        /// Iteratively reweights to demote wrong-direction outliers (typically clusters at the
+        /// path endpoints where the local cross-section degenerates) and only emits centers
+        /// inside the inlier arc-length range -- no extrapolation past where the data supports it.
+        /// The result is a single smooth, near-convex curve that follows the bulk of the centers.
+        /// </summary>
+        private static List<SensorArcSample> FitSmoothArcCenterCurve(IReadOnlyList<SensorArcSample> samples_, Double spacingInch_) {
+            Int32 n = samples_.Count;
+            List<SensorArcSample> result = new(n);
+            List<Double> ss = new(n);
+            List<Double> xs = new(n);
+            List<Double> ys = new(n);
+            List<Double> zs = new(n);
+            List<Double> rs = new(n);
+            for (Int32 i = 0; i < n; i++) {
+                SensorArcSample sa = samples_[i];
+                if (!sa.Valid || sa.Center is not Point3D ci) continue;
+                ss.Add(i * spacingInch_);
+                xs.Add(ci.X);
+                ys.Add(ci.Y);
+                zs.Add(ci.Z);
+                rs.Add(sa.Radius);
+            }
+            Int32 nValid = ss.Count;
+            // Need enough valid samples to fit a cubic. Fall back to a simple moving-average
+            // smoothing pass when there are too few -- better than crashing back to no smoothing.
+            if (nValid < 8) {
+                return SmoothArcSamplesAlongPath(samples_, halfWindow_: 4);
+            }
+            Int32 degree = 3;
+
+            Boolean[] keep = new Boolean[nValid];
+            for (Int32 i = 0; i < nValid; i++) keep[i] = true;
+            PolyFit cx = default, cy = default, cz = default, cr = default;
+            Int32 keepCount = nValid;
+            for (Int32 iter = 0; iter < 4; iter++) {
+                List<Double> sk = new(keepCount), xk = new(keepCount), yk = new(keepCount), zk = new(keepCount), rk = new(keepCount);
+                for (Int32 i = 0; i < nValid; i++) {
+                    if (!keep[i]) continue;
+                    sk.Add(ss[i]); xk.Add(xs[i]); yk.Add(ys[i]); zk.Add(zs[i]); rk.Add(rs[i]);
+                }
+                if (sk.Count < degree + 1) break;
+                if (!TryFitPolynomial(sk, xk, degree, out cx)) break;
+                if (!TryFitPolynomial(sk, yk, degree, out cy)) break;
+                if (!TryFitPolynomial(sk, zk, degree, out cz)) break;
+                if (!TryFitPolynomial(sk, rk, degree, out cr)) break;
+                Double[] residuals = new Double[nValid];
+                List<Double> resSorted = new(nValid);
+                for (Int32 i = 0; i < nValid; i++) {
+                    Double dx = cx.Eval(ss[i]) - xs[i];
+                    Double dy = cy.Eval(ss[i]) - ys[i];
+                    Double dz = cz.Eval(ss[i]) - zs[i];
+                    Double res = Math.Sqrt((dx * dx) + (dy * dy) + (dz * dz));
+                    residuals[i] = res;
+                    if (keep[i]) resSorted.Add(res);
+                }
+                if (resSorted.Count == 0) break;
+                resSorted.Sort();
+                Double median = resSorted[resSorted.Count / 2];
+                Double meanR = 0;
+                for (Int32 i = 0; i < nValid; i++) meanR += rs[i];
+                meanR /= nValid;
+                Double tol = Math.Max(median * 2.5, meanR * 0.05);
+                Int32 newKeep = 0;
+                Boolean changed = false;
+                for (Int32 i = 0; i < nValid; i++) {
+                    Boolean k = residuals[i] <= tol;
+                    if (k != keep[i]) changed = true;
+                    keep[i] = k;
+                    if (k) newKeep++;
+                }
+                keepCount = newKeep;
+                if (newKeep < degree + 1) break;
+                if (!changed) break;
+            }
+
+            Double sMinKept = Double.MaxValue, sMaxKept = Double.MinValue;
+            for (Int32 i = 0; i < nValid; i++) {
+                if (!keep[i]) continue;
+                if (ss[i] < sMinKept) sMinKept = ss[i];
+                if (ss[i] > sMaxKept) sMaxKept = ss[i];
+            }
+            if (sMinKept >= sMaxKept) {
+                return SmoothArcSamplesAlongPath(samples_, halfWindow_: 4);
+            }
+
+            for (Int32 i = 0; i < n; i++) {
+                Double s = i * spacingInch_;
+                if (s < sMinKept || s > sMaxKept) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                Point3D c = new(cx.Eval(s), cy.Eval(s), cz.Eval(s));
+                Double r = Math.Max(0, cr.Eval(s));
+                result.Add(new SensorArcSample(i + 1, c, r, true));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 1-D polynomial of degree d, stored centered at sMean for numerical conditioning:
+        /// p(s) = sum_k Coefs[k] * (s - SMean)^k.
+        /// </summary>
+        private readonly struct PolyFit {
+            public Double[] Coefs { get; }
+            public Double SMean { get; }
+            public PolyFit(Double[] coefs_, Double sMean_) { Coefs = coefs_; SMean = sMean_; }
+            public Double Eval(Double s_) {
+                if (Coefs is null || Coefs.Length == 0) return 0;
+                Double u = s_ - SMean;
+                Double y = 0;
+                Double up = 1;
+                for (Int32 i = 0; i < Coefs.Length; i++) {
+                    y += Coefs[i] * up;
+                    up *= u;
+                }
+                return y;
+            }
+        }
+
+        private static Boolean TryFitPolynomial(IReadOnlyList<Double> s_, IReadOnlyList<Double> y_, Int32 degree_, out PolyFit fit_) {
+            fit_ = default;
+            Int32 n = s_.Count;
+            Int32 d = degree_ + 1;
+            if (n < d || y_.Count != n) return false;
+            Double sMean = 0;
+            for (Int32 i = 0; i < n; i++) sMean += s_[i];
+            sMean /= n;
+            Double[,] AtA = new Double[d, d];
+            Double[] Aty = new Double[d];
+            Double[] powers = new Double[d];
+            for (Int32 i = 0; i < n; i++) {
+                Double u = s_[i] - sMean;
+                powers[0] = 1.0;
+                for (Int32 k = 1; k < d; k++) powers[k] = powers[k - 1] * u;
+                for (Int32 j = 0; j < d; j++) {
+                    for (Int32 k = 0; k < d; k++) AtA[j, k] += powers[j] * powers[k];
+                    Aty[j] += powers[j] * y_[i];
+                }
+            }
+            if (!SolveLinearSystem(AtA, Aty, out Double[] sol)) return false;
+            fit_ = new PolyFit(sol, sMean);
+            return true;
+        }
+
+        private static Boolean SolveLinearSystem(Double[,] m_, Double[] b_, out Double[] x_) {
+            Int32 n = b_.Length;
+            x_ = new Double[n];
+            Double[,] M = new Double[n, n + 1];
+            for (Int32 i = 0; i < n; i++) {
+                for (Int32 j = 0; j < n; j++) M[i, j] = m_[i, j];
+                M[i, n] = b_[i];
+            }
+            for (Int32 i = 0; i < n; i++) {
+                Int32 maxRow = i;
+                Double maxVal = Math.Abs(M[i, i]);
+                for (Int32 k = i + 1; k < n; k++) {
+                    Double v = Math.Abs(M[k, i]);
+                    if (v > maxVal) { maxVal = v; maxRow = k; }
+                }
+                if (maxVal < 1e-14) return false;
+                if (maxRow != i) {
+                    for (Int32 j = i; j <= n; j++) (M[i, j], M[maxRow, j]) = (M[maxRow, j], M[i, j]);
+                }
+                for (Int32 k = i + 1; k < n; k++) {
+                    Double f = M[k, i] / M[i, i];
+                    for (Int32 j = i; j <= n; j++) M[k, j] -= f * M[i, j];
+                }
+            }
+            for (Int32 i = n - 1; i >= 0; i--) {
+                Double s = M[i, n];
+                for (Int32 j = i + 1; j < n; j++) s -= M[i, j] * x_[j];
+                x_[i] = s / M[i, i];
+            }
+            return true;
         }
 
         /// <summary>
