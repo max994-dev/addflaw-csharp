@@ -45,8 +45,15 @@ namespace AddFlaw.Managers {
         private Vector3D _lastProbeDirection = new(0, 0, 1);
         private Double _lastProbeDiag = 1.0;
         private Double _lastPathSpacingInch;
-        private Int32? _lineDragLockRegionIndex;
-        private Int32 _lineDragPathStartIndex = -1;
+        // Cache for the unsampled anchored curve so changing point spacing does not
+        // re-run two A* searches across the whole mesh on every text-box update.
+        private ModelPartScanner.ScanResult? _cachedScanForControl;
+        private Point3D _cachedStartClick;
+        private Point3D _cachedMiddleClick;
+        private Point3D _cachedEndClick;
+        private List<Point3D>? _cachedAnchoredCenters;
+        private List<Vector3D>? _cachedAnchoredNormals;
+        private Int32 _cachedMiddleAnchorIndex = -1;
         private readonly Point3DCollection _pathCommittedLine = [];
         private readonly Point3DCollection _pathCommittedPoints = [];
         private Point3DCollection _pathActiveLine = [];
@@ -81,8 +88,6 @@ namespace AddFlaw.Managers {
         }
 
         public void ClearTransitionCenterline() {
-            _lineDragLockRegionIndex = null;
-            _lineDragPathStartIndex = -1;
             _pathCommittedLine.Clear();
             _pathCommittedPoints.Clear();
             _pathActiveLine = [];
@@ -91,7 +96,6 @@ namespace AddFlaw.Managers {
             _pointVisual.Points = [];
             _lastPathSpacingInch = 0;
             _probeXVisual.Points = [];
-            
             _probeYVisual.Points = [];
             _probeZVisual.Points = [];
             _probeBodyVisual.Content = null;
@@ -100,6 +104,14 @@ namespace AddFlaw.Managers {
             _lastFiveAxisSamples = [];
             _allSensorAxisSamples.Clear();
             _lastProbePosition = null;
+            InvalidateAnchoredCurveCache();
+        }
+
+        private void InvalidateAnchoredCurveCache() {
+            _cachedScanForControl = null;
+            _cachedAnchoredCenters = null;
+            _cachedAnchoredNormals = null;
+            _cachedMiddleAnchorIndex = -1;
         }
 
         public void UpdateControlPointPreview(Point3D? startPoint_, Point3D? middlePoint_, Point3D? endPoint_) {
@@ -113,16 +125,12 @@ namespace AddFlaw.Managers {
         public IReadOnlyList<SensorAxisSample> GetAllSensorAxisSamples() => _allSensorAxisSamples;
 
         public void BeginLineDragSession() {
-            _lineDragLockRegionIndex = null;
-            _lineDragPathStartIndex = -1;
             _pathActiveLine = [];
             _pathActivePoints = [];
             RefreshMergedPathVisuals();
         }
 
         public void EndLineDragSession() {
-            _lineDragLockRegionIndex = null;
-            _lineDragPathStartIndex = -1;
             foreach (Point3D p in _pathActiveLine)
                 _pathCommittedLine.Add(p);
             foreach (Point3D p in _pathActivePoints)
@@ -217,12 +225,48 @@ namespace AddFlaw.Managers {
             Point3D startPoint_,
             Point3D middlePoint_,
             Point3D endPoint_) {
-            if (!TraceSeamCenterPathBetweenTargets(scan_, middlePoint_, startPoint_, endPoint_, DEFAULT_NORMAL_GROW_ANGLE_DEG, out List<Int32>? triPath) ||
-                triPath is null ||
-                triPath.Count < 2)
-                return false;
-            return DrawFromOrderedTriPath(scan_, spacingInch_, triPath, middlePoint_, null, null, PathOverlayMode.FullReplace, useEdgeBiasedPoints_: false);
+            // Reuse last anchored curve when only the spacing changed: pure draw, no path search.
+            Boolean canReuse = ReferenceEquals(_cachedScanForControl, scan_)
+                && _cachedAnchoredCenters is { Count: >= 2 }
+                && _cachedAnchoredNormals is { Count: >= 2 }
+                && _cachedAnchoredCenters.Count == _cachedAnchoredNormals.Count
+                && PointsEqual(_cachedStartClick, startPoint_)
+                && PointsEqual(_cachedMiddleClick, middlePoint_)
+                && PointsEqual(_cachedEndClick, endPoint_);
+
+            List<Point3D> centers;
+            List<Vector3D> normals;
+            Int32 middleAnchorIndex;
+            if (canReuse) {
+                centers = _cachedAnchoredCenters!;
+                normals = _cachedAnchoredNormals!;
+                middleAnchorIndex = _cachedMiddleAnchorIndex;
+            } else {
+                if (!TryBuildAnchoredCurve(
+                        scan_,
+                        startPoint_,
+                        middlePoint_,
+                        endPoint_,
+                        out centers!,
+                        out normals!,
+                        out middleAnchorIndex)) {
+                    InvalidateAnchoredCurveCache();
+                    return false;
+                }
+                _cachedScanForControl = scan_;
+                _cachedStartClick = startPoint_;
+                _cachedMiddleClick = middlePoint_;
+                _cachedEndClick = endPoint_;
+                _cachedAnchoredCenters = centers;
+                _cachedAnchoredNormals = normals;
+                _cachedMiddleAnchorIndex = middleAnchorIndex;
+            }
+
+            return DrawFromAnchoredCurve(scan_, spacingInch_, centers, normals, middleAnchorIndex, middlePoint_);
         }
+
+        private static Boolean PointsEqual(Point3D a_, Point3D b_) =>
+            a_.X == b_.X && a_.Y == b_.Y && a_.Z == b_.Z;
 
         public Boolean DrawClosestTransitionCenterlineIfNear(ModelPartScanner.ScanResult scan_, Double spacingInch_, Point3D approxPoint_, Double maxDistance_) {
             if (scan_.TriCenters.Count == 0 || maxDistance_ <= 0)
@@ -283,140 +327,307 @@ namespace AddFlaw.Managers {
             return triPath_.Count > 1;
         }
 
-        private static Boolean TraceSeamCenterPathBetweenTargets(
+        /// <summary>
+        /// Build the unsampled centroid polyline for the start->middle->end control-point path.
+        /// Two A* searches over the triangle dual graph (start->mid, mid->end), then the user's
+        /// click positions are pinned at the polyline endpoints and at the join (middle anchor).
+        /// </summary>
+        private static Boolean TryBuildAnchoredCurve(
             ModelPartScanner.ScanResult scan_,
-            Point3D middlePoint_,
             Point3D startPoint_,
+            Point3D middlePoint_,
             Point3D endPoint_,
-            Double maxNormalAngleDeg_,
-            out List<Int32>? triPath_) {
-            triPath_ = null;
-            if (scan_.TriCenters.Count == 0 || scan_.TriAdjacency.Count == 0)
+            out List<Point3D>? centers_,
+            out List<Vector3D>? normals_,
+            out Int32 middleAnchorIndex_) {
+            centers_ = null;
+            normals_ = null;
+            middleAnchorIndex_ = -1;
+            Int32 n = scan_.TriCenters.Count;
+            if (n == 0 || scan_.TriAdjacency.Count != n || scan_.TriNormals.Count != n)
                 return false;
 
-            Int32 midTri = FindNearestTriangle(scan_, middlePoint_);
             Int32 startTri = FindNearestTriangle(scan_, startPoint_);
+            Int32 midTri = FindNearestTriangle(scan_, middlePoint_);
             Int32 endTri = FindNearestTriangle(scan_, endPoint_);
-            if (midTri < 0 || startTri < 0 || endTri < 0)
+            if (startTri < 0 || midTri < 0 || endTri < 0)
                 return false;
 
-            if (!TryFindGuidedShortestTrianglePath(scan_, startTri, midTri, startPoint_, middlePoint_, out List<Int32>? toMiddle) ||
-                toMiddle is null ||
-                toMiddle.Count < 1)
+            if (!TryAStarTrianglePath(scan_, startTri, midTri, out List<Int32>? a) || a is null)
+                return false;
+            if (!TryAStarTrianglePath(scan_, midTri, endTri, out List<Int32>? b) || b is null)
                 return false;
 
-            if (!TryFindGuidedShortestTrianglePath(scan_, midTri, endTri, middlePoint_, endPoint_, out List<Int32>? toEnd) ||
-                toEnd is null ||
-                toEnd.Count < 1)
+            // Concatenate the two halves; the duplicated mid triangle (b[0] == midTri == a[^1]) is dropped.
+            List<Int32> tris = new(a.Count + b.Count);
+            tris.AddRange(a);
+            for (Int32 i = 1; i < b.Count; i++)
+                tris.Add(b[i]);
+            if (tris.Count < 1)
                 return false;
 
-            if (toEnd.Count > 0)
-                toEnd.RemoveAt(0);
-            triPath_ = [.. toMiddle, .. toEnd];
-            return triPath_.Count > 1;
+            // Build [startClick, center(t0), center(t1), ..., center(tN), endClick] so the visible
+            // line literally begins/ends at the user's click positions, not at triangle centroids.
+            centers_ = new List<Point3D>(tris.Count + 2);
+            normals_ = new List<Vector3D>(tris.Count + 2);
+            centers_.Add(startPoint_);
+            normals_.Add(scan_.TriNormals[startTri]);
+            for (Int32 i = 0; i < tris.Count; i++) {
+                centers_.Add(scan_.TriCenters[tris[i]]);
+                normals_.Add(scan_.TriNormals[tris[i]]);
+            }
+            centers_.Add(endPoint_);
+            normals_.Add(scan_.TriNormals[endTri]);
+
+            // The midTri centroid sits at index (1 + a.Count - 1) = a.Count in the centers_ layout.
+            // Replace it with the user's middle-click point so the path is pinned at all 3 controls.
+            Int32 midIdx = a.Count;
+            if (midIdx > 0 && midIdx < centers_.Count - 1) {
+                centers_[midIdx] = middlePoint_;
+                middleAnchorIndex_ = midIdx;
+            }
+            return centers_.Count >= 2;
         }
 
-        private static Boolean TryFindGuidedShortestTrianglePath(
+        /// <summary>
+        /// A* shortest path on the triangle adjacency graph using triangle-centroid distance as
+        /// step cost (with a small bend penalty across sharp normal changes), and the Euclidean
+        /// distance from the candidate centroid to the goal centroid as the heuristic.
+        /// The heuristic is admissible (every actual step cost >= the Euclidean step length, and
+        /// the sum of step lengths along any path is >= the straight line to the goal), so the
+        /// returned path is the optimal one under this cost.
+        /// </summary>
+        private static Boolean TryAStarTrianglePath(
             ModelPartScanner.ScanResult scan_,
             Int32 startTri_,
             Int32 targetTri_,
-            Point3D guideStart_,
-            Point3D guideEnd_,
             out List<Int32>? path_) {
             path_ = null;
             Int32 n = scan_.TriCenters.Count;
-            if (startTri_ < 0 || startTri_ >= n || targetTri_ < 0 || targetTri_ >= n || scan_.TriAdjacency.Count != n)
+            if (startTri_ < 0 || startTri_ >= n || targetTri_ < 0 || targetTri_ >= n)
                 return false;
             if (startTri_ == targetTri_) {
                 path_ = [startTri_];
                 return true;
             }
 
-            Double[] dist = Enumerable.Repeat(Double.PositiveInfinity, n).ToArray();
-            Int32[] prev = Enumerable.Repeat(-1, n).ToArray();
-            PriorityQueue<Int32, Double> open = new();
-            dist[startTri_] = 0;
-            open.Enqueue(startTri_, 0);
+            Double[] gScore = new Double[n];
+            for (Int32 i = 0; i < n; i++) gScore[i] = Double.PositiveInfinity;
+            Int32[] cameFrom = new Int32[n];
+            for (Int32 i = 0; i < n; i++) cameFrom[i] = -1;
 
-            while (open.TryDequeue(out Int32 cur, out Double curDist)) {
-                if (curDist > dist[cur] + 1e-12)
-                    continue;
-                if (cur == targetTri_)
-                    break;
+            Point3D goalCenter = scan_.TriCenters[targetTri_];
+            PriorityQueue<Int32, Double> open = new();
+            gScore[startTri_] = 0;
+            open.Enqueue(startTri_, (scan_.TriCenters[startTri_] - goalCenter).Length);
+
+            while (open.TryDequeue(out Int32 cur, out Double _)) {
+                if (cur == targetTri_) {
+                    path_ = ReconstructTrianglePath(cameFrom, targetTri_, startTri_);
+                    return path_ is { Count: >= 1 };
+                }
+                Point3D pCur = scan_.TriCenters[cur];
+                Vector3D nCur = scan_.TriNormals[cur];
+                Boolean curHasNormal = nCur.LengthSquared > 1e-18;
+                if (curHasNormal) nCur.Normalize();
 
                 foreach (Int32 next in scan_.TriAdjacency[cur]) {
-                    if (next < 0 || next >= n)
-                        continue;
+                    if (next < 0 || next >= n) continue;
+                    Vector3D stepVec = scan_.TriCenters[next] - pCur;
+                    Double stepLen = stepVec.Length;
+                    if (stepLen < 1e-12) continue;
 
-                    Double stepCost = GuidedTriangleStepCost(scan_, cur, next, guideStart_, guideEnd_);
-                    if (!Double.IsFinite(stepCost) || stepCost <= 0)
-                        continue;
+                    // Slight extra cost for crossing a sharp normal break: prefer paths that stay on
+                    // the same locally smooth surface region instead of cutting across creases. The
+                    // multiplier stays >= 1 so the Euclidean heuristic remains admissible.
+                    Double bend = 0.0;
+                    if (curHasNormal) {
+                        Vector3D nNext = scan_.TriNormals[next];
+                        if (nNext.LengthSquared > 1e-18) {
+                            nNext.Normalize();
+                            bend = Math.Max(0.0, 1.0 - Vector3D.DotProduct(nCur, nNext));
+                        }
+                    }
+                    Double tentative = gScore[cur] + (stepLen * (1.0 + (0.5 * bend)));
+                    if (tentative >= gScore[next]) continue;
 
-                    Double nd = curDist + stepCost;
-                    if (nd >= dist[next])
-                        continue;
-
-                    dist[next] = nd;
-                    prev[next] = cur;
-                    open.Enqueue(next, nd);
+                    cameFrom[next] = cur;
+                    gScore[next] = tentative;
+                    Double h = (scan_.TriCenters[next] - goalCenter).Length;
+                    open.Enqueue(next, tentative + h);
                 }
             }
+            return false;
+        }
 
-            if (!Double.IsFinite(dist[targetTri_]))
-                return false;
-
-            List<Int32> rev = [];
-            for (Int32 cur = targetTri_; cur >= 0; cur = prev[cur]) {
-                rev.Add(cur);
-                if (cur == startTri_)
-                    break;
+        private static List<Int32>? ReconstructTrianglePath(Int32[] cameFrom_, Int32 target_, Int32 start_) {
+            List<Int32> rev = [target_];
+            Int32 cur = target_;
+            // Bound the walk by cameFrom_.Length to stop runaway loops on a corrupted predecessor map.
+            for (Int32 guard = 0; guard < cameFrom_.Length && cur != start_; guard++) {
+                Int32 prev = cameFrom_[cur];
+                if (prev < 0) return null;
+                rev.Add(prev);
+                cur = prev;
             }
-            if (rev[^1] != startTri_)
+            if (rev[^1] != start_) return null;
+            rev.Reverse();
+            return rev;
+        }
+
+        /// <summary>
+        /// Take the unsampled anchored centroid polyline (with click anchors pinned at start, middle,
+        /// end), smooth it without dragging the anchors, resample at uniform spacing, lift each
+        /// sample off the surface, and update the visuals + sensor axis tables.
+        /// </summary>
+        private Boolean DrawFromAnchoredCurve(
+            ModelPartScanner.ScanResult scan_,
+            Double spacingInch_,
+            List<Point3D> centers_,
+            List<Vector3D> normals_,
+            Int32 middleAnchorIndex_,
+            Point3D probeAnchor_) {
+            if (centers_.Count < 2 || normals_.Count != centers_.Count) return false;
+            if (scan_.MeshSlots.Count == 0) return false;
+
+            Double spacing = Math.Max(0.01, spacingInch_);
+            HashSet<Int32> pinned = [0, centers_.Count - 1];
+            if (middleAnchorIndex_ > 0 && middleAnchorIndex_ < centers_.Count - 1)
+                _ = pinned.Add(middleAnchorIndex_);
+
+            // Light smoothing that pins the anchor indices in place: the line stays anchored to the
+            // user's clicks while still removing the worst centroid-to-centroid staircasing.
+            Int32 smoothRadius = Math.Clamp(centers_.Count / 18, 1, 3);
+            List<Point3D> smoothed = SmoothPathPreservingPinned(centers_, smoothRadius, pinned);
+            smoothed = SmoothPathPreservingPinned(smoothed, smoothRadius, pinned);
+
+            if (!TryResamplePathWithSegments(smoothed, spacing, out List<Point3D>? samples, out List<(Int32 seg, Double t)>? sampleSeg) ||
+                samples is null || sampleSeg is null || samples.Count < 2)
                 return false;
 
-            rev.Reverse();
-            path_ = rev;
-            return path_.Count > 0;
+            // Re-pin endpoints exactly: smoothing/resampling rounding must not nudge the visible
+            // line off the clicked start/end positions.
+            samples[0] = centers_[0];
+            samples[^1] = centers_[^1];
+
+            // Per-sample probe normal: linearly interpolate between the two centroid normals that
+            // bracket the sample's arc-length position, then re-normalize. This eliminates the
+            // discontinuous "nearest centroid" lookup that previously caused stair-stepped lifts
+            // and jumpy A/B angles along the strip.
+            List<Vector3D> sampleNormals = new(samples.Count);
+            for (Int32 i = 0; i < samples.Count; i++) {
+                (Int32 seg, Double t) = sampleSeg[i];
+                Vector3D na = normals_[seg];
+                Vector3D nb = normals_[Math.Min(seg + 1, normals_.Count - 1)];
+                if (na.LengthSquared < 1e-18) na = new Vector3D(0, 0, 1);
+                if (nb.LengthSquared < 1e-18) nb = na;
+                na.Normalize();
+                nb.Normalize();
+                Vector3D mix = (na * (1.0 - t)) + (nb * t);
+                if (mix.LengthSquared < 1e-18) mix = na;
+                mix.Normalize();
+                sampleNormals.Add(mix);
+            }
+
+            Rect3D bounds = scan_.MeshSlots[0].OwnerModel.Bounds;
+            Double diag = Math.Sqrt((bounds.SizeX * bounds.SizeX) + (bounds.SizeY * bounds.SizeY) + (bounds.SizeZ * bounds.SizeZ));
+            Double lift = Math.Max(0.0002, diag * 0.00003);
+            Double minClearance = Math.Max(lift * 1.5, diag * 0.00008);
+
+            List<Vector3D> outDirs = new(samples.Count);
+            for (Int32 i = 0; i < samples.Count; i++) {
+                Vector3D outward = ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis);
+                samples[i] = LiftSampleAlongDirection(samples[i], outward, lift, minClearance, scan_.ModelCenter, scan_.ModelAxis);
+                outDirs.Add(outward);
+            }
+
+            Int32 nearestIdx = NearestSampleIndex(samples, probeAnchor_);
+            _lastFiveAxisSamples = BuildFiveAxisSamples(samples, outDirs, nearestIdx);
+            _allSensorAxisSamples.Clear();
+            for (Int32 i = 0; i < samples.Count; i++)
+                _allSensorAxisSamples.Add(ToAxisSample(i + 1, samples[i], outDirs[i]));
+
+            if (_probeEnabled) {
+                UpdateProbeVisual(samples[nearestIdx], outDirs[nearestIdx], diag);
+            } else {
+                _probeXVisual.Points = [];
+                _probeYVisual.Points = [];
+                _probeZVisual.Points = [];
+                _probeBodyVisual.Content = null;
+            }
+
+            _lastPathSpacingInch = spacing;
+            Point3DCollection lineSegments = [];
+            AddPolylineAsSegments(lineSegments, samples);
+            Point3DCollection pointCollection = [];
+            foreach (Point3D p in samples)
+                pointCollection.Add(p);
+
+            _pathActiveLine = [];
+            _pathActivePoints = [];
+            _pathCommittedLine.Clear();
+            _pathCommittedPoints.Clear();
+            foreach (Point3D p in lineSegments)
+                _pathCommittedLine.Add(p);
+            foreach (Point3D p in pointCollection)
+                _pathCommittedPoints.Add(p);
+            _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
+            _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
+            return lineSegments.Count >= 2;
         }
 
-        private static Double GuidedTriangleStepCost(
-            ModelPartScanner.ScanResult scan_,
-            Int32 fromTri_,
-            Int32 toTri_,
-            Point3D guideStart_,
-            Point3D guideEnd_) {
-            Point3D from = scan_.TriCenters[fromTri_];
-            Point3D to = scan_.TriCenters[toTri_];
-            Vector3D step = to - from;
-            Double stepLen = step.Length;
-            if (stepLen < 1e-12)
-                return Double.PositiveInfinity;
-
-            Vector3D guide = guideEnd_ - guideStart_;
-            Double guideLen = guide.Length;
-            if (guideLen < 1e-12)
-                return stepLen;
-
-            step.Normalize();
-            guide.Normalize();
-
-            Double forwardPenalty = Math.Pow(Math.Max(0, 1.0 - Vector3D.DotProduct(step, guide)), 2.0);
-            Double lateral = DistancePointToSegment(to, guideStart_, guideEnd_);
-            Double guideScale = Math.Max(guideLen * 0.05, stepLen * 4.0);
-            Double lateralPenalty = Math.Min(4.0, lateral / Math.Max(guideScale, 1e-9));
-
-            return stepLen * (1.0 + (0.75 * forwardPenalty) + (0.35 * lateralPenalty));
+        /// <summary>
+        /// Compose a probe-out direction from a per-sample interpolated mesh normal plus a small
+        /// radial-outward bias from the model spin axis. The bias keeps the probe pointing away
+        /// from the hub interior on cylindrical/blade-style parts even when the local mesh normal
+        /// happens to face the wrong way (e.g. on inverted or noisy STL faces).
+        /// </summary>
+        private static Vector3D ComposeOutsideDirection(
+            Vector3D sampleNormal_,
+            Point3D samplePoint_,
+            Point3D modelCenter_,
+            Vector3D modelAxis_) {
+            Vector3D n = sampleNormal_;
+            if (n.LengthSquared < 1e-18) n = new Vector3D(0, 0, 1);
+            n.Normalize();
+            Vector3D radialOut = ComputeRadialOutward(samplePoint_, modelCenter_, modelAxis_);
+            if (Vector3D.DotProduct(n, radialOut) < 0)
+                n = -n;
+            Vector3D mixed = n + (radialOut * 1.25);
+            if (mixed.LengthSquared < 1e-18) return radialOut;
+            mixed.Normalize();
+            return mixed;
         }
 
-        private static Double DistancePointToSegment(Point3D p_, Point3D a_, Point3D b_) {
-            Vector3D ab = b_ - a_;
-            Double ab2 = ab.LengthSquared;
-            if (ab2 < 1e-18)
-                return (p_ - a_).Length;
-            Double t = Vector3D.DotProduct(p_ - a_, ab) / ab2;
-            t = Math.Clamp(t, 0.0, 1.0);
-            Point3D q = a_ + (ab * t);
-            return (p_ - q).Length;
+        /// <summary>
+        /// Lift a sample off the surface along an outward direction, with two safety guards:
+        /// (1) never move inward toward the shaft axis, and (2) keep at least minClearance ahead
+        /// of the original sample along the chosen outward direction.
+        /// </summary>
+        private static Point3D LiftSampleAlongDirection(
+            Point3D sample_,
+            Vector3D outward_,
+            Double lift_,
+            Double minClearance_,
+            Point3D modelCenter_,
+            Vector3D modelAxis_) {
+            Vector3D outward = outward_;
+            if (outward.LengthSquared < 1e-18) outward = new Vector3D(0, 0, 1);
+            outward.Normalize();
+
+            Point3D moved = sample_ + (outward * lift_);
+            Double r0 = RadialDistanceFromAxis(sample_, modelCenter_, modelAxis_);
+            Double r1 = RadialDistanceFromAxis(moved, modelCenter_, modelAxis_);
+            if (r1 <= r0 + 1e-9) {
+                Vector3D radialOut = ComputeRadialOutward(sample_, modelCenter_, modelAxis_);
+                moved = sample_ + (radialOut * lift_);
+                outward = radialOut;
+            }
+
+            Double alongOut = Vector3D.DotProduct(moved - sample_, outward);
+            if (alongOut < minClearance_)
+                moved += outward * (minClearance_ - alongOut);
+            return moved;
         }
 
         private static Int32 FindNearestTriangle(ModelPartScanner.ScanResult scan_, Point3D point_) {
@@ -430,115 +641,6 @@ namespace AddFlaw.Managers {
                 if (d2 < bestD2) {
                     bestD2 = d2;
                     best = i;
-                }
-            }
-            return best;
-        }
-
-        private static List<Int32> TraceDirectionTowardTarget(
-            ModelPartScanner.ScanResult scan_,
-            Int32 startTri_,
-            Int32 targetTri_,
-            Double maxNormalAngleDeg_,
-            Int32 maxSteps_) {
-            if (startTri_ == targetTri_)
-                return [startTri_];
-
-            Double cosThreshold = Math.Cos(Math.Clamp(maxNormalAngleDeg_, 0, 89.9) * (Math.PI / 180.0));
-            HashSet<Int32> used = [startTri_];
-            List<Int32> path = [startTri_];
-            Int32 prev = -1;
-            Int32 cur = startTri_;
-            Double bestToTarget = (scan_.TriCenters[cur] - scan_.TriCenters[targetTri_]).LengthSquared;
-
-            for (Int32 step = 0; step < maxSteps_; step++) {
-                if (cur == targetTri_)
-                    break;
-                Int32 next = SelectBestSeamNeighborTowardTarget(scan_, prev, cur, targetTri_, used, cosThreshold);
-                if (next < 0)
-                    break;
-
-                Double d2 = (scan_.TriCenters[next] - scan_.TriCenters[targetTri_]).LengthSquared;
-                // Prevent long detours that move away from chosen end triangle.
-                if (d2 > (bestToTarget * 1.8) + 1e-12)
-                    break;
-
-                path.Add(next);
-                used.Add(next);
-                prev = cur;
-                cur = next;
-                if (d2 < bestToTarget)
-                    bestToTarget = d2;
-            }
-            return path;
-        }
-
-        private static Int32 SelectBestSeamNeighborTowardTarget(
-            ModelPartScanner.ScanResult scan_,
-            Int32 prevTri_,
-            Int32 curTri_,
-            Int32 targetTri_,
-            IReadOnlySet<Int32> used_,
-            Double cosThreshold_) {
-            Vector3D nCur = scan_.TriNormals[curTri_];
-            if (nCur.LengthSquared < 1e-18) return -1;
-            nCur.Normalize();
-
-            Point3D pCur = scan_.TriCenters[curTri_];
-            Vector3D targetDir = scan_.TriCenters[targetTri_] - pCur;
-            if (targetDir.LengthSquared < 1e-18)
-                return targetTri_;
-            targetDir.Normalize();
-
-            Vector3D forward = new();
-            Boolean hasForward = prevTri_ >= 0;
-            if (hasForward) {
-                forward = pCur - scan_.TriCenters[prevTri_];
-                if (forward.LengthSquared < 1e-18) hasForward = false;
-                else forward.Normalize();
-            }
-
-            Int32 best = -1;
-            Double bestScore = Double.NegativeInfinity;
-            foreach (Int32 n in scan_.TriAdjacency[curTri_]) {
-                if (n < 0 || n >= scan_.TriCenters.Count || used_.Contains(n))
-                    continue;
-
-                Vector3D nNbr = scan_.TriNormals[n];
-                if (nNbr.LengthSquared < 1e-18)
-                    continue;
-                nNbr.Normalize();
-                Double cos = Vector3D.DotProduct(nCur, nNbr);
-                if (cos < cosThreshold_)
-                    continue;
-
-                Double curArea = scan_.TriAreas[curTri_];
-                Double nbrArea = scan_.TriAreas[n];
-                if (curArea <= 1e-14 || nbrArea <= 1e-14)
-                    continue;
-                Double areaRatio = nbrArea / curArea;
-                if (areaRatio < MIN_NEIGHBOR_AREA_RATIO || areaRatio > MAX_NEIGHBOR_AREA_RATIO)
-                    continue;
-
-                Vector3D step = scan_.TriCenters[n] - pCur;
-                if (step.LengthSquared < 1e-18)
-                    continue;
-                step.Normalize();
-
-                Double continuation = hasForward ? Math.Max(0, Vector3D.DotProduct(step, forward)) : 0.5;
-                Double towardTarget = Math.Max(0, Vector3D.DotProduct(step, targetDir));
-                Double targetDistance = (scan_.TriCenters[n] - scan_.TriCenters[targetTri_]).Length;
-                Double targetCloseness = 1.0 / (1.0 + targetDistance);
-                Double smoothNormal = (cos + 1.0) * 0.5;
-                Double areaSimilarity = 1.0 - Math.Clamp(Math.Abs(Math.Log(areaRatio, 2.0)) / 2.0, 0.0, 1.0);
-                Double score = (smoothNormal * 0.20) + (continuation * 0.20) + (towardTarget * 0.35) + (targetCloseness * 0.20) + (areaSimilarity * 0.05);
-
-                if (n == targetTri_)
-                    score += 100.0;
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = n;
                 }
             }
             return best;
@@ -1492,34 +1594,80 @@ namespace AddFlaw.Managers {
             return outPts;
         }
 
-        private static Boolean TryResamplePath(IReadOnlyList<Point3D> path_, Double spacing_, out List<Point3D>? sampled_) {
+        private static Boolean TryResamplePath(IReadOnlyList<Point3D> path_, Double spacing_, out List<Point3D>? sampled_) =>
+            TryResamplePathWithSegments(path_, spacing_, out sampled_, out _);
+
+        /// <summary>
+        /// Linear-time arc-length resampler. Walks the segment cursor monotonically with the
+        /// sample arc-length s instead of restarting it from zero on every sample (the previous
+        /// implementation was O(samples * segments)).
+        /// Optionally returns, for each output sample, the source-segment index and the local
+        /// fractional position t in [0, 1] inside that segment, so callers can interpolate
+        /// per-vertex attributes (e.g. mesh normals) consistently with the resampled positions.
+        /// </summary>
+        private static Boolean TryResamplePathWithSegments(
+            IReadOnlyList<Point3D> path_,
+            Double spacing_,
+            out List<Point3D>? sampled_,
+            out List<(Int32 seg, Double t)>? sampleSeg_) {
             sampled_ = null;
+            sampleSeg_ = null;
             if (path_.Count < 2 || spacing_ <= 0) return false;
-            List<Double> cum = [0];
-            Double total = 0;
-            for (Int32 i = 1; i < path_.Count; i++) {
-                total += (path_[i] - path_[i - 1]).Length;
-                cum.Add(total);
-            }
+
+            Double[] cum = new Double[path_.Count];
+            cum[0] = 0;
+            for (Int32 i = 1; i < path_.Count; i++)
+                cum[i] = cum[i - 1] + (path_[i] - path_[i - 1]).Length;
+            Double total = cum[^1];
             if (total < 1e-6) return false;
+
             sampled_ = [];
+            sampleSeg_ = [];
+            Int32 seg = 0;
             for (Double s = 0; s <= total + 1e-9; s += spacing_) {
-                Int32 seg = 0;
-                while (seg + 1 < cum.Count && cum[seg + 1] < s) seg++;
-                if (seg + 1 >= cum.Count) {
+                while (seg + 1 < cum.Length && cum[seg + 1] < s) seg++;
+                if (seg + 1 >= cum.Length) {
                     sampled_.Add(path_[^1]);
+                    sampleSeg_.Add((path_.Count - 2, 1.0));
                     continue;
                 }
                 Double segLen = Math.Max(1e-9, cum[seg + 1] - cum[seg]);
-                Double t = (s - cum[seg]) / segLen;
+                Double t = Math.Clamp((s - cum[seg]) / segLen, 0.0, 1.0);
                 Point3D a = path_[seg];
                 Point3D b = path_[seg + 1];
                 sampled_.Add(new Point3D(
                     a.X + ((b.X - a.X) * t),
                     a.Y + ((b.Y - a.Y) * t),
                     a.Z + ((b.Z - a.Z) * t)));
+                sampleSeg_.Add((seg, t));
             }
             return sampled_.Count > 1;
+        }
+
+        /// <summary>
+        /// Moving-average smooth that holds the supplied indices fixed.
+        /// Used for the control-point flow so the user's clicked start / middle / end positions
+        /// stay exactly on the drawn line even after smoothing.
+        /// </summary>
+        private static List<Point3D> SmoothPathPreservingPinned(IReadOnlyList<Point3D> pts_, Int32 radius_, IReadOnlySet<Int32> pinned_) {
+            if (pts_.Count <= 2 || radius_ <= 0) return [.. pts_];
+            Int32 last = pts_.Count - 1;
+            List<Point3D> outPts = new(pts_.Count);
+            for (Int32 i = 0; i < pts_.Count; i++) {
+                if (i == 0 || i == last || pinned_.Contains(i)) {
+                    outPts.Add(pts_[i]);
+                    continue;
+                }
+                Int32 i0 = Math.Max(0, i - radius_);
+                Int32 i1 = Math.Min(last, i + radius_);
+                Double sx = 0, sy = 0, sz = 0;
+                Int32 n = 0;
+                for (Int32 j = i0; j <= i1; j++) {
+                    sx += pts_[j].X; sy += pts_[j].Y; sz += pts_[j].Z; n++;
+                }
+                outPts.Add(new Point3D(sx / n, sy / n, sz / n));
+            }
+            return outPts;
         }
 
         private static List<SensorAxisSample> BuildFiveAxisSamples(IReadOnlyList<Point3D> points_, IReadOnlyList<Vector3D> dirs_, Int32 centerIdx_) {
