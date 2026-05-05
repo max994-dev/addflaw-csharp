@@ -6,6 +6,14 @@ using HelixToolkit.Wpf;
 namespace AddFlaw.Managers {
     public sealed class TransitionRegionManager {
         public sealed record SensorAxisSample(Int32 Index, Double X, Double Y, Double Z, Double A, Double B);
+        /// <summary>
+        /// Per-sample local-arc fit for the sensor path. The fillet/blend that the path traverses is locally a
+        /// circular cross-section: in the plane perpendicular to the path tangent through this sample, the
+        /// surface is approximately an arc of radius <see cref="Radius"/> centered at <see cref="Center"/>.
+        /// <see cref="Center"/> is null and <see cref="Valid"/> is false when the local cross-section is too
+        /// flat / too noisy / has too few mesh points to fit a circle reliably.
+        /// </summary>
+        public sealed record SensorArcSample(Int32 Index, Point3D? Center, Double Radius, Boolean Valid);
         private const Double DEFAULT_NORMAL_GROW_ANGLE_DEG = 15.0;
         private const Double MIN_NEIGHBOR_AREA_RATIO = 0.40;
         private const Double MAX_NEIGHBOR_AREA_RATIO = 2.50;
@@ -38,8 +46,14 @@ namespace AddFlaw.Managers {
         private readonly PointsVisual3D _controlEndVisual = new() { Color = Color.FromRgb(0xE7, 0x4C, 0x3C), Size = 10.0 };
         private readonly LinesVisual3D _sideExpandVectorVisual = new() { Color = Color.FromRgb(0xFF, 0x66, 0xCC), Thickness = 1.4 };
         private readonly PointsVisual3D _sideExpandPointVisual = new() { Color = Color.FromRgb(0xB0, 0x5C, 0xFF), Size = 4.0 };
+        // Arc-of-fillet fit visuals (one orange dot per sample's arc center, plus a thin green radius
+        // line from each sample to its center). Mirrors the picture the user gave: a single arc center
+        // with green radii reaching out to the surface samples on the same fillet cross-section.
+        private readonly PointsVisual3D _arcCenterVisual = new() { Color = Color.FromRgb(0xFF, 0x8C, 0x00), Size = 8.0 };
+        private readonly LinesVisual3D _arcRadiusVisual = new() { Color = Color.FromRgb(0x33, 0xCC, 0x33), Thickness = 1.5 };
         private readonly List<SensorAxisSample> _allSensorAxisSamples = [];
         private List<SensorAxisSample> _lastFiveAxisSamples = [];
+        private List<SensorArcSample> _lastArcSamples = [];
         private Boolean _probeEnabled;
         private Point3D? _lastProbePosition;
         private Vector3D _lastProbeDirection = new(0, 0, 1);
@@ -81,6 +95,10 @@ namespace AddFlaw.Managers {
                 viewport_.Children.Add(_sideExpandVectorVisual);
             if (!viewport_.Children.Contains(_sideExpandPointVisual))
                 viewport_.Children.Add(_sideExpandPointVisual);
+            if (!viewport_.Children.Contains(_arcRadiusVisual))
+                viewport_.Children.Add(_arcRadiusVisual);
+            if (!viewport_.Children.Contains(_arcCenterVisual))
+                viewport_.Children.Add(_arcCenterVisual);
         }
 
         public void DrawTransitionCenterline(ModelPartScanner.ScanResult scan_, Double spacingInch_) {
@@ -101,6 +119,9 @@ namespace AddFlaw.Managers {
             _probeBodyVisual.Content = null;
             _sideExpandVectorVisual.Points = [];
             _sideExpandPointVisual.Points = [];
+            _arcCenterVisual.Points = [];
+            _arcRadiusVisual.Points = [];
+            _lastArcSamples = [];
             _lastFiveAxisSamples = [];
             _allSensorAxisSamples.Clear();
             _lastProbePosition = null;
@@ -123,6 +144,8 @@ namespace AddFlaw.Managers {
         public IReadOnlyList<SensorAxisSample> GetLastFiveAxisSamples() => _lastFiveAxisSamples;
 
         public IReadOnlyList<SensorAxisSample> GetAllSensorAxisSamples() => _allSensorAxisSamples;
+
+        public IReadOnlyList<SensorArcSample> GetArcCenters() => _lastArcSamples;
 
         public void BeginLineDragSession() {
             _pathActiveLine = [];
@@ -534,6 +557,12 @@ namespace AddFlaw.Managers {
             Double lift = Math.Max(0.0002, diag * 0.00003);
             Double minClearance = Math.Max(lift * 1.5, diag * 0.00008);
 
+            // Per-sample local-arc fit BEFORE the lift mutates `samples`. The arc center is a property
+            // of the on-surface fillet, not of the lifted probe position, so we use the raw resampled
+            // points + the interpolated mesh normals here.
+            List<Point3D> surfaceSamples = new(samples);
+            _lastArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
+
             List<Vector3D> outDirs = new(samples.Count);
             for (Int32 i = 0; i < samples.Count; i++) {
                 Vector3D outward = ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis);
@@ -573,7 +602,182 @@ namespace AddFlaw.Managers {
                 _pathCommittedPoints.Add(p);
             _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
             _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
+
+            // Arc visuals: orange dot at each fitted center, thin green line from each lifted sample
+            // (the visible sensor dot) to its arc center. Skip samples whose fit was rejected.
+            Point3DCollection arcCenterPts = [];
+            Point3DCollection arcRadiusLines = [];
+            for (Int32 i = 0; i < _lastArcSamples.Count && i < samples.Count; i++) {
+                SensorArcSample arc = _lastArcSamples[i];
+                if (!arc.Valid || arc.Center is not Point3D c)
+                    continue;
+                arcCenterPts.Add(c);
+                arcRadiusLines.Add(samples[i]);
+                arcRadiusLines.Add(c);
+            }
+            _arcCenterVisual.Points = arcCenterPts;
+            _arcRadiusVisual.Points = arcRadiusLines;
             return lineSegments.Count >= 2;
+        }
+
+        /// <summary>
+        /// For each on-surface sample, fit the local fillet cross-section circle and return its 3D
+        /// center + radius. The cross-section plane at sample i is the plane perpendicular to the
+        /// path tangent at i; we project nearby triangle centers (those whose distance along the
+        /// path-tangent axis is within a thin band) onto the (binormal, normal) basis at the sample
+        /// and run a Kasa algebraic least-squares circle fit. The result is the orange center +
+        /// green radius from the user-supplied screenshot, one per sensor sample.
+        /// </summary>
+        private static List<SensorArcSample> ComputeArcCentersForSamples(
+            ModelPartScanner.ScanResult scan_,
+            IReadOnlyList<Point3D> samples_,
+            IReadOnlyList<Vector3D> sampleNormals_,
+            Double spacingInch_,
+            Double modelDiag_) {
+            Int32 nSamples = samples_.Count;
+            List<SensorArcSample> result = new(nSamples);
+            if (nSamples < 2 || sampleNormals_.Count != nSamples || scan_.TriCenters.Count == 0) {
+                for (Int32 i = 0; i < nSamples; i++)
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                return result;
+            }
+
+            // Search box. Proportional to point spacing so the cross-section width adapts when the
+            // user changes Point Spacing, with a model-scale floor so it still works on very fine
+            // spacings. The radius cap rejects implausibly huge "arcs" coming from near-flat regions.
+            Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.05);
+            Double searchRadius2 = searchRadius * searchRadius;
+            Double bandThickness = Math.Max(spacingInch_ * 1.0, modelDiag_ * 0.005);
+            Double minPlausibleR = Math.Max(spacingInch_ * 0.5, modelDiag_ * 0.0005);
+            Double maxPlausibleR = searchRadius * 2.0;
+
+            IReadOnlyList<Point3D> triCenters = scan_.TriCenters;
+            Int32 nTri = triCenters.Count;
+            List<(Double x, Double y)> cs = new(64);
+
+            for (Int32 i = 0; i < nSamples; i++) {
+                Point3D P = samples_[i];
+                Vector3D N = sampleNormals_[i];
+                if (N.LengthSquared < 1e-18) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                N.Normalize();
+
+                // Path tangent from neighbors (use the symmetric difference where possible).
+                Int32 prev = Math.Max(0, i - 1);
+                Int32 next = Math.Min(nSamples - 1, i + 1);
+                Vector3D T = samples_[next] - samples_[prev];
+                if (T.LengthSquared < 1e-18) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                T.Normalize();
+
+                // Binormal: across-spine direction, lying in the cross-section plane along the surface.
+                Vector3D B = Vector3D.CrossProduct(N, T);
+                if (B.LengthSquared < 1e-18) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                B.Normalize();
+                // Re-orthogonalize the in-plane "outward" direction so (B, N2) is exactly orthonormal.
+                Vector3D N2 = Vector3D.CrossProduct(T, B);
+                if (N2.LengthSquared < 1e-18) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                N2.Normalize();
+                if (Vector3D.DotProduct(N2, N) < 0) N2 = -N2;
+
+                cs.Clear();
+                cs.Add((0, 0)); // sample itself sits at the origin of the (B, N2) basis.
+                for (Int32 t = 0; t < nTri; t++) {
+                    Vector3D d = triCenters[t] - P;
+                    Double along = Vector3D.DotProduct(d, T);
+                    if (Math.Abs(along) > bandThickness) continue;
+                    if (d.LengthSquared > searchRadius2) continue;
+                    Double bx = Vector3D.DotProduct(d, B);
+                    Double ny = Vector3D.DotProduct(d, N2);
+                    cs.Add((bx, ny));
+                }
+
+                if (cs.Count < 5) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+
+                if (!TryFitCircle2DKasa(cs, out Double a, out Double b, out Double r)) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+
+                // Sanity: center must be on the open-space (outward-normal) side of the surface,
+                // and radius must lie in the plausible fillet-radius range. Otherwise the fit is
+                // dominated by noise or the surface is not actually arc-like at this sample.
+                if (b <= 0 || !Double.IsFinite(r) || r < minPlausibleR || r > maxPlausibleR) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+
+                Point3D center3d = P + (B * a) + (N2 * b);
+                result.Add(new SensorArcSample(i + 1, center3d, r, true));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Algebraic (Kasa) least-squares circle fit in 2D. Linearises the circle equation as
+        /// 2 a x + 2 b y + c = x^2 + y^2 (with c = r^2 - a^2 - b^2) and solves the resulting 3x3
+        /// normal-equations system via Cramer's rule. Returns false on a near-singular system or
+        /// a non-positive r^2.
+        /// </summary>
+        private static Boolean TryFitCircle2DKasa(IReadOnlyList<(Double x, Double y)> pts_, out Double a_, out Double b_, out Double r_) {
+            a_ = b_ = r_ = 0;
+            Int32 n = pts_.Count;
+            if (n < 3) return false;
+
+            Double sxx = 0, sxy = 0, syy = 0, sx = 0, sy = 0;
+            Double sxr = 0, syr = 0, sr = 0;
+            foreach ((Double x, Double y) in pts_) {
+                Double rr = (x * x) + (y * y);
+                sxx += x * x;
+                sxy += x * y;
+                syy += y * y;
+                sx += x;
+                sy += y;
+                sxr += x * rr;
+                syr += y * rr;
+                sr += rr;
+            }
+            // Normal equations for [a, b, c] in 2 a x_i + 2 b y_i + c = x_i^2 + y_i^2.
+            Double m00 = 4 * sxx, m01 = 4 * sxy, m02 = 2 * sx;
+            Double m10 = 4 * sxy, m11 = 4 * syy, m12 = 2 * sy;
+            Double m20 = 2 * sx, m21 = 2 * sy, m22 = n;
+            Double r0 = 2 * sxr, r1 = 2 * syr, r2 = sr;
+
+            Double det = (m00 * ((m11 * m22) - (m12 * m21)))
+                       - (m01 * ((m10 * m22) - (m12 * m20)))
+                       + (m02 * ((m10 * m21) - (m11 * m20)));
+            if (Math.Abs(det) < 1e-18) return false;
+
+            Double a = ((r0 * ((m11 * m22) - (m12 * m21)))
+                      - (m01 * ((r1 * m22) - (m12 * r2)))
+                      + (m02 * ((r1 * m21) - (m11 * r2)))) / det;
+            Double b = ((m00 * ((r1 * m22) - (m12 * r2)))
+                      - (r0 * ((m10 * m22) - (m12 * m20)))
+                      + (m02 * ((m10 * r2) - (r1 * m20)))) / det;
+            Double c = ((m00 * ((m11 * r2) - (r1 * m21)))
+                      - (m01 * ((m10 * r2) - (r1 * m20)))
+                      + (r0 * ((m10 * m21) - (m11 * m20)))) / det;
+
+            Double r2sq = c + (a * a) + (b * b);
+            if (r2sq <= 0 || !Double.IsFinite(r2sq)) return false;
+
+            a_ = a;
+            b_ = b;
+            r_ = Math.Sqrt(r2sq);
+            return true;
         }
 
         /// <summary>

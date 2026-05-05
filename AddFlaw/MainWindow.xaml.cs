@@ -492,18 +492,33 @@ namespace AddFlaw {
                 return;
 
             try {
-                List<String> lines = ["Index,X,Y,Z,A_deg,B_deg"];
-                foreach (TransitionRegionManager.SensorAxisSample s in all) {
+                IReadOnlyList<TransitionRegionManager.SensorArcSample> arcs = _transitionRegionManager.GetArcCenters();
+                List<String> lines = ["Index,X,Y,Z,A_deg,B_deg,Cx,Cy,Cz,R"];
+                Int32 validArcs = 0;
+                for (Int32 i = 0; i < all.Count; i++) {
+                    TransitionRegionManager.SensorAxisSample s = all[i];
+                    String cx = "", cy = "", cz = "", rr = "";
+                    if (i < arcs.Count) {
+                        TransitionRegionManager.SensorArcSample arc = arcs[i];
+                        if (arc.Valid && arc.Center is Point3D c) {
+                            cx = c.X.ToString("0.########", CultureInfo.InvariantCulture);
+                            cy = c.Y.ToString("0.########", CultureInfo.InvariantCulture);
+                            cz = c.Z.ToString("0.########", CultureInfo.InvariantCulture);
+                            rr = arc.Radius.ToString("0.########", CultureInfo.InvariantCulture);
+                            validArcs++;
+                        }
+                    }
                     lines.Add(String.Join(",",
                         s.Index.ToString(CultureInfo.InvariantCulture),
                         s.X.ToString("0.########", CultureInfo.InvariantCulture),
                         s.Y.ToString("0.########", CultureInfo.InvariantCulture),
                         s.Z.ToString("0.########", CultureInfo.InvariantCulture),
                         s.A.ToString("0.######", CultureInfo.InvariantCulture),
-                        s.B.ToString("0.######", CultureInfo.InvariantCulture)));
+                        s.B.ToString("0.######", CultureInfo.InvariantCulture),
+                        cx, cy, cz, rr));
                 }
                 System.IO.File.WriteAllLines(dlg.FileName, lines);
-                _uiStateManager.SetStatus($"Exported {all.Count} sensor points to CSV.");
+                _uiStateManager.SetStatus($"Exported {all.Count} sensor points to CSV ({validArcs} with arc centers).");
             } catch (Exception ex) {
                 _ = MessageBox.Show($"Error exporting sensor CSV: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
