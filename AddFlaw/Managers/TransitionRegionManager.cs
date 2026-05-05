@@ -877,15 +877,25 @@ namespace AddFlaw.Managers {
             Int32 nValid = ss.Count;
             // Need enough valid samples to fit a cubic. Fall back to a simple moving-average
             // smoothing pass when there are too few -- better than crashing back to no smoothing.
-            if (nValid < 8) {
+            if (nValid < 12) {
                 return SmoothArcSamplesAlongPath(samples_, halfWindow_: 4);
             }
             Int32 degree = 3;
 
             Boolean[] keep = new Boolean[nValid];
             for (Int32 i = 0; i < nValid; i++) keep[i] = true;
+            // Hard-trim a fixed margin from each end of the valid run before fitting. Endpoint
+            // samples consistently sit on transitions where the path leaves the fillet onto an
+            // edge or flat surface; their per-sample fits systematically point in the wrong
+            // direction. Iterative reweighting alone can't catch them because the cubic happily
+            // bends to fit them, so we drop them up front.
+            Int32 endTrim = Math.Max(8, nValid / 8);
+            endTrim = Math.Min(endTrim, (nValid - 6) / 2); // leave at least 6 in the middle
+            for (Int32 i = 0; i < endTrim; i++) keep[i] = false;
+            for (Int32 i = nValid - endTrim; i < nValid; i++) keep[i] = false;
+            Int32 keepCount = nValid - (2 * endTrim);
+            Int32 minKeep = Math.Max(degree + 2, (nValid * 4) / 10);
             PolyFit cx = default, cy = default, cz = default, cr = default;
-            Int32 keepCount = nValid;
             for (Int32 iter = 0; iter < 4; iter++) {
                 List<Double> sk = new(keepCount), xk = new(keepCount), yk = new(keepCount), zk = new(keepCount), rk = new(keepCount);
                 for (Int32 i = 0; i < nValid; i++) {
@@ -913,7 +923,7 @@ namespace AddFlaw.Managers {
                 Double meanR = 0;
                 for (Int32 i = 0; i < nValid; i++) meanR += rs[i];
                 meanR /= nValid;
-                Double tol = Math.Max(median * 2.5, meanR * 0.05);
+                Double tol = Math.Max(median * 2.0, meanR * 0.03);
                 Int32 newKeep = 0;
                 Boolean changed = false;
                 for (Int32 i = 0; i < nValid; i++) {
@@ -923,7 +933,7 @@ namespace AddFlaw.Managers {
                     if (k) newKeep++;
                 }
                 keepCount = newKeep;
-                if (newKeep < degree + 1) break;
+                if (newKeep < minKeep) break;
                 if (!changed) break;
             }
 
