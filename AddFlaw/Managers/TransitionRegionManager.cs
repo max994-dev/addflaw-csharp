@@ -54,6 +54,9 @@ namespace AddFlaw.Managers {
         // Smoothed polyline that connects consecutive valid arc centers. Drawn as a thicker
         // dark-orange line so the centers read as a continuous curve and not a noisy point cloud.
         private readonly LinesVisual3D _arcCenterPathVisual = new() { Color = Color.FromRgb(0xCC, 0x55, 0x00), Thickness = 2.5 };
+        // Translucent bright overlay over only the triangles we classified as belonging to the
+        // fillet/arc surface. Lets the user verify that we are detecting the right region.
+        private readonly ModelVisual3D _arcSurfaceVisual = new();
         private readonly List<SensorAxisSample> _allSensorAxisSamples = [];
         private List<SensorAxisSample> _lastFiveAxisSamples = [];
         private List<SensorArcSample> _lastArcSamples = [];
@@ -104,6 +107,8 @@ namespace AddFlaw.Managers {
                 viewport_.Children.Add(_arcCenterPathVisual);
             if (!viewport_.Children.Contains(_arcCenterVisual))
                 viewport_.Children.Add(_arcCenterVisual);
+            if (!viewport_.Children.Contains(_arcSurfaceVisual))
+                viewport_.Children.Add(_arcSurfaceVisual);
         }
 
         public void DrawTransitionCenterline(ModelPartScanner.ScanResult scan_, Double spacingInch_) {
@@ -127,6 +132,7 @@ namespace AddFlaw.Managers {
             _arcCenterVisual.Points = [];
             _arcRadiusVisual.Points = [];
             _arcCenterPathVisual.Points = [];
+            _arcSurfaceVisual.Content = null;
             _lastArcSamples = [];
             _lastFiveAxisSamples = [];
             _allSensorAxisSamples.Clear();
@@ -503,11 +509,12 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// Take the unsampled anchored centroid polyline (with the middle click pinned as waypoint),
-        /// smooth it without dragging the anchors, resample at uniform spacing, lift each sample off
-        /// the surface, and update the visuals + sensor axis tables. The start/end triangle centroids
-        /// are the natural endpoints; the user's start/end click positions are not inserted into the
-        /// arc center path.
+        /// Step 1 of the rebuild: ignore path generation entirely. Take the centroid guide path
+        /// from the user's start/middle/end clicks, find the connected fillet/arc triangles
+        /// reachable from those triangles by walking only through curvy triangles (a triangle is
+        /// curvy if at least one mesh-adjacent neighbour has a normal differing by &gt; 8 deg),
+        /// and overlay them on the model in a bright translucent colour. No sensor path, no
+        /// points, no probe -- just the arc surface region so the user can verify the detection.
         /// </summary>
         private Boolean DrawFromAnchoredCurve(
             ModelPartScanner.ScanResult scan_,
@@ -519,149 +526,109 @@ namespace AddFlaw.Managers {
             if (centers_.Count < 2 || normals_.Count != centers_.Count) return false;
             if (scan_.MeshSlots.Count == 0) return false;
 
-            Double spacing = Math.Max(0.01, spacingInch_);
-            HashSet<Int32> pinned = [0, centers_.Count - 1];
-            if (middleAnchorIndex_ > 0 && middleAnchorIndex_ < centers_.Count - 1)
-                _ = pinned.Add(middleAnchorIndex_);
+            HashSet<Int32> arcTris = CollectArcTriangles(scan_, centers_);
+            if (arcTris.Count == 0) return false;
 
-            // Light smoothing that pins the anchor indices in place: the line stays anchored to the
-            // middle waypoint and keeps its natural centroid-derived endpoints while still removing
-            // the worst centroid-to-centroid staircasing.
-            Int32 smoothRadius = Math.Clamp(centers_.Count / 18, 1, 3);
-            List<Point3D> smoothed = SmoothPathPreservingPinned(centers_, smoothRadius, pinned);
-            smoothed = SmoothPathPreservingPinned(smoothed, smoothRadius, pinned);
+            Color arcColor = Color.FromArgb(0xCC, 0xFF, 0x40, 0x80);
+            _arcSurfaceVisual.Content = BuildHighlightedTriangleModel(scan_, arcTris, arcColor);
 
-            if (!TryResamplePathWithSegments(smoothed, spacing, out List<Point3D>? samples, out List<(Int32 seg, Double t)>? sampleSeg) ||
-                samples is null || sampleSeg is null || samples.Count < 2)
-                return false;
-
-            // Per-sample probe normal: linearly interpolate between the two centroid normals that
-            // bracket the sample's arc-length position, then re-normalize. This eliminates the
-            // discontinuous "nearest centroid" lookup that previously caused stair-stepped lifts
-            // and jumpy A/B angles along the strip.
-            List<Vector3D> sampleNormals = new(samples.Count);
-            for (Int32 i = 0; i < samples.Count; i++) {
-                (Int32 seg, Double t) = sampleSeg[i];
-                Vector3D na = normals_[seg];
-                Vector3D nb = normals_[Math.Min(seg + 1, normals_.Count - 1)];
-                if (na.LengthSquared < 1e-18) na = new Vector3D(0, 0, 1);
-                if (nb.LengthSquared < 1e-18) nb = na;
-                na.Normalize();
-                nb.Normalize();
-                Vector3D mix = (na * (1.0 - t)) + (nb * t);
-                if (mix.LengthSquared < 1e-18) mix = na;
-                mix.Normalize();
-                sampleNormals.Add(mix);
-            }
-
-            Rect3D bounds = scan_.MeshSlots[0].OwnerModel.Bounds;
-            Double diag = Math.Sqrt((bounds.SizeX * bounds.SizeX) + (bounds.SizeY * bounds.SizeY) + (bounds.SizeZ * bounds.SizeZ));
-
-            // Fit a Kasa circle to each cross-section of the fillet along the on-surface guide
-            // path. The median-angle point from the arc is the arc midpoint -- a point ON the
-            // fillet surface. The triangle-centroid guide path is only used to orient the
-            // cross-section planes.
-            List<Point3D> surfaceSamples = new(samples);
-            List<SensorArcSample> rawArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
-
-            // Outward directions at each guide-path surface sample: used for A/B probe angles.
-            List<Vector3D> outDirs = new(samples.Count);
-            for (Int32 i = 0; i < samples.Count; i++)
-                outDirs.Add(ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis));
-
-            // Keep ONLY valid arc midpoints. Do NOT fall back to lifted surface positions.
-            // Lifted surface points lie on the blade/hub surface, not the fillet; mixing them
-            // into the path creates the "junk" loops at the start and end seen when the
-            // cross-section fit fails in the transition regions at the path endpoints.
-            List<Point3D> sensorPositions = new(rawArcSamples.Count);
-            List<Vector3D> filteredOutDirs = new(rawArcSamples.Count);
-            for (Int32 i = 0; i < rawArcSamples.Count; i++) {
-                SensorArcSample sa = rawArcSamples[i];
-                if (sa.Valid && sa.Center is Point3D c) {
-                    sensorPositions.Add(c);
-                    filteredOutDirs.Add(outDirs[i]);
-                }
-            }
-            if (sensorPositions.Count < 2) return false;
-            outDirs = filteredOutDirs;
-
-            // Sort arc midpoints monotonically by their projection along the overall
-            // start→end direction. Raw cross-section samples can be out of order when
-            // adjacent guide-path stations pick from opposite ends of the arc, which
-            // would produce zigzags that no amount of smoothing can fix. Sorting first
-            // guarantees the path progresses consistently from start to end.
-            if (sensorPositions.Count >= 3) {
-                Vector3D mainDir = sensorPositions[^1] - sensorPositions[0];
-                if (mainDir.LengthSquared > 1e-18) {
-                    mainDir.Normalize();
-                    Point3D origin = sensorPositions[0];
-                    Double[] proj = new Double[sensorPositions.Count];
-                    Int32[] sortIdx = new Int32[sensorPositions.Count];
-                    for (Int32 i = 0; i < sensorPositions.Count; i++) {
-                        proj[i] = Vector3D.DotProduct(sensorPositions[i] - origin, mainDir);
-                        sortIdx[i] = i;
-                    }
-                    Array.Sort(proj, sortIdx);
-                    List<Point3D> sortedPos = new(sensorPositions.Count);
-                    List<Vector3D> sortedDirs = new(sensorPositions.Count);
-                    foreach (Int32 idx in sortIdx) {
-                        sortedPos.Add(sensorPositions[idx]);
-                        sortedDirs.Add(outDirs[idx]);
-                    }
-                    sensorPositions = sortedPos;
-                    outDirs = sortedDirs;
-                }
-            }
-
-            // Polynomial least-squares fit through the (sorted) arc midpoints. Degree 3 in
-            // chord-length parameter t allows a 3D-bending fillet but limits the curve to at
-            // most one inflection -- effectively forcing a single smooth convex line from
-            // start to end. Falls back to the un-fitted points if the fit is degenerate.
-            Int32 polyDegree = Math.Min(3, sensorPositions.Count - 1);
-            if (TryFitPolynomialPath(sensorPositions, polyDegree, sensorPositions.Count, out List<Point3D> fitted))
-                sensorPositions = fitted;
-
-            _lastArcSamples = rawArcSamples;
-
-            Int32 nearestIdx = NearestSampleIndex(sensorPositions, probeAnchor_);
-            _lastFiveAxisSamples = BuildFiveAxisSamples(sensorPositions, outDirs, nearestIdx);
-            _allSensorAxisSamples.Clear();
-            for (Int32 i = 0; i < sensorPositions.Count; i++)
-                _allSensorAxisSamples.Add(ToAxisSample(i + 1, sensorPositions[i], outDirs[i]));
-
-            if (_probeEnabled) {
-                UpdateProbeVisual(sensorPositions[nearestIdx], outDirs[nearestIdx], diag);
-            } else {
-                _probeXVisual.Points = [];
-                _probeYVisual.Points = [];
-                _probeZVisual.Points = [];
-                _probeBodyVisual.Content = null;
-            }
-
-            _lastPathSpacingInch = spacing;
-            Point3DCollection lineSegments = [];
-            AddPolylineAsSegments(lineSegments, sensorPositions);
-            Point3DCollection pointCollection = [];
-            foreach (Point3D p in sensorPositions)
-                pointCollection.Add(p);
-
+            // Clear all the path / probe / arc-center visuals: this rebuild step only shows
+            // the highlighted arc surface so we can confirm the region detection first.
             _pathActiveLine = [];
             _pathActivePoints = [];
             _pathCommittedLine.Clear();
             _pathCommittedPoints.Clear();
-            foreach (Point3D p in lineSegments)
-                _pathCommittedLine.Add(p);
-            foreach (Point3D p in pointCollection)
-                _pathCommittedPoints.Add(p);
-            _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
-            _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
-
-            // Arc center positions are now the primary path visual above. The secondary arc-center
-            // path overlay is cleared to avoid a confusing duplicate.
+            _lineVisual.Points = [];
+            _pointVisual.Points = [];
+            _probeXVisual.Points = [];
+            _probeYVisual.Points = [];
+            _probeZVisual.Points = [];
+            _probeBodyVisual.Content = null;
             _arcCenterVisual.Points = [];
             _arcRadiusVisual.Points = [];
             _arcCenterPathVisual.Points = [];
-            return lineSegments.Count >= 2;
+            _lastArcSamples = [];
+            _lastFiveAxisSamples = [];
+            _allSensorAxisSamples.Clear();
+            _lastPathSpacingInch = Math.Max(0.01, spacingInch_);
+
+            _ = probeAnchor_;
+            _ = middleAnchorIndex_;
+            return true;
+        }
+
+        /// <summary>
+        /// Walk the mesh adjacency starting from each guide-path triangle, accepting only
+        /// curvy triangles into the result and only crossing into curvy neighbours. The result
+        /// is the connected fillet/arc surface around the user's path. Flat hub or blade
+        /// triangles fail the curvy test and so the BFS stops at the fillet boundary.
+        /// </summary>
+        private static HashSet<Int32> CollectArcTriangles(
+            ModelPartScanner.ScanResult scan_,
+            List<Point3D> guidePathPoints_) {
+            HashSet<Int32> result = [];
+            Int32 nTri = scan_.TriCenters.Count;
+            if (nTri == 0 || scan_.TriAdjacency.Count != nTri || scan_.TriNormals.Count != nTri)
+                return result;
+            Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
+
+            HashSet<Int32> seeds = [];
+            foreach (Point3D p in guidePathPoints_) {
+                Int32 t = FindNearestTriangle(scan_, p);
+                if (t >= 0 && IsTriangleCurvy(scan_, t, cosCurvyThresh)) _ = seeds.Add(t);
+            }
+            if (seeds.Count == 0) return result;
+
+            Queue<Int32> bfs = new();
+            foreach (Int32 s in seeds) {
+                if (result.Add(s)) bfs.Enqueue(s);
+            }
+            while (bfs.Count > 0) {
+                Int32 t = bfs.Dequeue();
+                if (t >= scan_.TriAdjacency.Count) continue;
+                foreach (Int32 nbr in scan_.TriAdjacency[t]) {
+                    if (nbr < 0 || nbr >= nTri) continue;
+                    if (result.Contains(nbr)) continue;
+                    if (!IsTriangleCurvy(scan_, nbr, cosCurvyThresh)) continue;
+                    _ = result.Add(nbr);
+                    bfs.Enqueue(nbr);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Build a renderable GeometryModel3D containing only the requested triangles, shaded
+        /// with a translucent emissive material so the highlight is clearly visible regardless
+        /// of scene lighting.
+        /// </summary>
+        private static GeometryModel3D? BuildHighlightedTriangleModel(
+            ModelPartScanner.ScanResult scan_,
+            HashSet<Int32> triangleIndices_,
+            Color color_) {
+            if (triangleIndices_.Count == 0) return null;
+            Point3DCollection positions = [];
+            Int32Collection indices = [];
+            foreach (Int32 globalTri in triangleIndices_) {
+                if (!TryGetTriangleVertices(scan_, globalTri, out Point3D p0, out Point3D p1, out Point3D p2)) continue;
+                Int32 baseIdx = positions.Count;
+                positions.Add(p0);
+                positions.Add(p1);
+                positions.Add(p2);
+                indices.Add(baseIdx);
+                indices.Add(baseIdx + 1);
+                indices.Add(baseIdx + 2);
+            }
+            if (positions.Count == 0) return null;
+            MeshGeometry3D mesh = new() { Positions = positions, TriangleIndices = indices };
+            MaterialGroup mat = new();
+            mat.Children.Add(new DiffuseMaterial(new SolidColorBrush(color_)));
+            mat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(0x80, color_.R, color_.G, color_.B))));
+            return new GeometryModel3D {
+                Geometry = mesh,
+                Material = mat,
+                BackMaterial = mat
+            };
         }
 
         /// <summary>
