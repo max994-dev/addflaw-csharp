@@ -556,42 +556,42 @@ namespace AddFlaw.Managers {
 
             Rect3D bounds = scan_.MeshSlots[0].OwnerModel.Bounds;
             Double diag = Math.Sqrt((bounds.SizeX * bounds.SizeX) + (bounds.SizeY * bounds.SizeY) + (bounds.SizeZ * bounds.SizeZ));
-            Double lift = Math.Max(0.0002, diag * 0.00003);
-            Double minClearance = Math.Max(lift * 1.5, diag * 0.00008);
 
             // Fit a Kasa circle to each cross-section of the fillet along the on-surface guide
-            // path. The center of each fitted circle is the arc center at that station -- a 3D
-            // point that is NOT on the mesh surface but is the geometric center of the fillet arc.
-            // These arc centers are the actual sensor path; the triangle-centroid guide path is
-            // only used to set up the cross-section planes for the circle fitting.
+            // path. The median-angle point from the arc is the arc midpoint -- a point ON the
+            // fillet surface. The triangle-centroid guide path is only used to orient the
+            // cross-section planes.
             List<Point3D> surfaceSamples = new(samples);
             List<SensorArcSample> rawArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
 
-            // Outward direction per sample: derived from the on-surface normal + radial bias.
-            // Used for probe A/B angles; also provides the lift direction for the fallback
-            // positions used when a cross-section circle fit fails at a particular station.
+            // Outward directions at each guide-path surface sample: used for A/B probe angles.
             List<Vector3D> outDirs = new(samples.Count);
-            List<Point3D> liftedSamples = new(samples);
-            for (Int32 i = 0; i < samples.Count; i++) {
-                Vector3D outward = ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis);
-                liftedSamples[i] = LiftSampleAlongDirection(samples[i], outward, lift, minClearance, scan_.ModelCenter, scan_.ModelAxis);
-                outDirs.Add(outward);
-            }
+            for (Int32 i = 0; i < samples.Count; i++)
+                outDirs.Add(ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis));
 
-            // Primary sensor positions: arc center where the Kasa fit succeeded; lifted surface
-            // position as fallback for any station where the cross-section fit failed.
-            List<Point3D> sensorPositions = new(samples.Count);
-            for (Int32 i = 0; i < samples.Count; i++) {
+            // Keep ONLY valid arc midpoints. Do NOT fall back to lifted surface positions.
+            // Lifted surface points lie on the blade/hub surface, not the fillet; mixing them
+            // into the path creates the "junk" loops at the start and end seen when the
+            // cross-section fit fails in the transition regions at the path endpoints.
+            List<Point3D> sensorPositions = new(rawArcSamples.Count);
+            List<Vector3D> filteredOutDirs = new(rawArcSamples.Count);
+            for (Int32 i = 0; i < rawArcSamples.Count; i++) {
                 SensorArcSample sa = rawArcSamples[i];
-                sensorPositions.Add(sa.Valid && sa.Center is Point3D c ? c : liftedSamples[i]);
+                if (sa.Valid && sa.Center is Point3D c) {
+                    sensorPositions.Add(c);
+                    filteredOutDirs.Add(outDirs[i]);
+                }
             }
+            if (sensorPositions.Count < 2) return false;
+            outDirs = filteredOutDirs;
 
-            // Light smoothing on arc center positions to suppress per-sample Kasa fitting noise
-            // (e.g. at cross-sections where only a partial arc was captured). Endpoints are pinned
-            // so the path stays anchored at the natural fillet terminations.
-            HashSet<Int32> arcPinned = [0, sensorPositions.Count - 1];
-            sensorPositions = SmoothPathPreservingPinned(sensorPositions, smoothRadius, arcPinned);
-            sensorPositions = SmoothPathPreservingPinned(sensorPositions, smoothRadius, arcPinned);
+            // Aggressive multi-pass smoothing to turn the noisy per-cross-section arc midpoints
+            // into a single smooth convex line. No endpoint pinning: the natural arc endpoints
+            // (where the fillet transitions to flat surface) should converge, not be anchored
+            // to guide-path triangle centroids which may be in the wrong region.
+            Int32 arcSmooth = Math.Clamp(sensorPositions.Count / 5, 2, 10);
+            for (Int32 pass = 0; pass < 4; pass++)
+                sensorPositions = SmoothPathPreservingPinned(sensorPositions, arcSmooth, new HashSet<Int32>());
 
             _lastArcSamples = rawArcSamples;
 
