@@ -570,9 +570,17 @@ namespace AddFlaw.Managers {
             // straggler triangles that survive the curvy filter near the ends of the fillet.
             List<Point3D> surfaceSamples = new(samples);
             _lastArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
-            // Smooth centers + radii along the path, treating invalid samples as breaks so the
-            // connecting polyline stays continuous within each valid run.
-            _lastArcSamples = SmoothArcSamplesAlongPath(_lastArcSamples, halfWindow_: 3);
+            // Outlier pass: reject samples whose center sits far from the local mean of its
+            // neighbours' centers. Two passes so a contiguous run of bad samples (typically at the
+            // start/end of the path where the cross-section transitions onto a flat surface or
+            // an edge) gets fully removed instead of dragging the smoothed curve in the wrong
+            // direction.
+            _lastArcSamples = RejectArcCenterOutliers(_lastArcSamples, halfWindow_: 5, maxLateralRatio_: 0.6);
+            _lastArcSamples = RejectArcCenterOutliers(_lastArcSamples, halfWindow_: 5, maxLateralRatio_: 0.6);
+            // Two smoothing passes (half-window 4 each) -- equivalent to a wider Gaussian than a
+            // single moving average, with much less ringing than a single half-window-8 pass.
+            _lastArcSamples = SmoothArcSamplesAlongPath(_lastArcSamples, halfWindow_: 4);
+            _lastArcSamples = SmoothArcSamplesAlongPath(_lastArcSamples, halfWindow_: 4);
 
             List<Vector3D> outDirs = new(samples.Count);
             for (Int32 i = 0; i < samples.Count; i++) {
@@ -614,14 +622,9 @@ namespace AddFlaw.Managers {
             _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
             _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
 
-            // Arc visuals:
-            //   * orange dot at each smoothed arc center
-            //   * thin green line from each lifted sample (the visible sensor dot) to its center
-            //   * dark-orange polyline connecting consecutive valid centers; the polyline breaks
-            //     wherever a sample's fit was rejected so a single bad sample doesn't draw a chord
-            //     across an unrelated region of the path
-            Point3DCollection arcCenterPts = [];
-            Point3DCollection arcRadiusLines = [];
+            // Arc visuals: only the smoothed arc-center polyline is drawn. The per-sample dots and
+            // the radii lines are intentionally left blank (the user wants a clean curve, not a
+            // point cloud with vertical lines).
             Point3DCollection arcCenterPath = [];
             Point3D? prevCenter = null;
             for (Int32 i = 0; i < _lastArcSamples.Count && i < samples.Count; i++) {
@@ -630,17 +633,14 @@ namespace AddFlaw.Managers {
                     prevCenter = null;
                     continue;
                 }
-                arcCenterPts.Add(c);
-                arcRadiusLines.Add(samples[i]);
-                arcRadiusLines.Add(c);
                 if (prevCenter is Point3D pc) {
                     arcCenterPath.Add(pc);
                     arcCenterPath.Add(c);
                 }
                 prevCenter = c;
             }
-            _arcCenterVisual.Points = arcCenterPts;
-            _arcRadiusVisual.Points = arcRadiusLines;
+            _arcCenterVisual.Points = [];
+            _arcRadiusVisual.Points = [];
             _arcCenterPathVisual.Points = arcCenterPath;
             return lineSegments.Count >= 2;
         }
@@ -720,8 +720,11 @@ namespace AddFlaw.Managers {
                 Vector3D radialOut = ComputeRadialOutward(P, scan_.ModelCenter, scan_.ModelAxis);
                 if (Vector3D.DotProduct(N, radialOut) < 0) N = -N;
 
-                Int32 prev = Math.Max(0, i - 1);
-                Int32 next = Math.Min(nSamples - 1, i + 1);
+                // Wide tangent window (i-2 .. i+2) for stability, especially at the path endpoints
+                // where a 2-sample tangent is noisy and pushes the cross-section plane sideways,
+                // producing the "wrong-direction" centers seen at the start/end of long paths.
+                Int32 prev = Math.Max(0, i - 2);
+                Int32 next = Math.Min(nSamples - 1, i + 2);
                 Vector3D T = samples_[next] - samples_[prev];
                 if (T.LengthSquared < 1e-18) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
@@ -834,6 +837,52 @@ namespace AddFlaw.Managers {
                 result.Add(new SensorArcSample(i + 1, center3d, r, true));
             }
             return result;
+        }
+
+        /// <summary>
+        /// Reject per-sample arc fits whose center sits far from the local trend of its
+        /// neighbours' centers. For each valid sample i we compute the mean center over
+        /// [i - halfWindow, i + halfWindow] excluding i itself; if the actual center for i is
+        /// more than maxLateralRatio_ * R_avg away from that mean, the sample is marked invalid.
+        /// Catches the "wrong-direction" centers that appear at the start/end of a path where the
+        /// cross-section transitions out of the fillet onto a flat or edge region.
+        /// </summary>
+        private static List<SensorArcSample> RejectArcCenterOutliers(IReadOnlyList<SensorArcSample> samples_, Int32 halfWindow_, Double maxLateralRatio_) {
+            Int32 n = samples_.Count;
+            List<SensorArcSample> outList = new(n);
+            if (n == 0) return outList;
+            Int32 hw = Math.Max(1, halfWindow_);
+            for (Int32 i = 0; i < n; i++) {
+                SensorArcSample s = samples_[i];
+                if (!s.Valid || s.Center is not Point3D ci) {
+                    outList.Add(s);
+                    continue;
+                }
+                Double sx = 0, sy = 0, sz = 0, sr = 0;
+                Int32 cnt = 0;
+                Int32 lo = Math.Max(0, i - hw);
+                Int32 hi = Math.Min(n - 1, i + hw);
+                for (Int32 j = lo; j <= hi; j++) {
+                    if (j == i) continue;
+                    SensorArcSample sj = samples_[j];
+                    if (!sj.Valid || sj.Center is not Point3D cj) continue;
+                    sx += cj.X; sy += cj.Y; sz += cj.Z; sr += sj.Radius;
+                    cnt++;
+                }
+                if (cnt < 2) {
+                    outList.Add(s);
+                    continue;
+                }
+                Point3D mean = new(sx / cnt, sy / cnt, sz / cnt);
+                Double meanR = sr / cnt;
+                Double tol = Math.Max(s.Radius, meanR) * maxLateralRatio_;
+                if ((ci - mean).Length > tol) {
+                    outList.Add(new SensorArcSample(s.Index, null, 0, false));
+                } else {
+                    outList.Add(s);
+                }
+            }
+            return outList;
         }
 
         /// <summary>
