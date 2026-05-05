@@ -559,34 +559,50 @@ namespace AddFlaw.Managers {
             Double lift = Math.Max(0.0002, diag * 0.00003);
             Double minClearance = Math.Max(lift * 1.5, diag * 0.00008);
 
-            // Per-sample local-arc fit BEFORE the lift mutates `samples`. The arc center is a
-            // property of the on-surface fillet, not of the lifted probe position, so we use the
-            // raw resampled points + the interpolated mesh normals here.
+            // Fit a Kasa circle to each cross-section of the fillet along the on-surface guide
+            // path. The center of each fitted circle is the arc center at that station -- a 3D
+            // point that is NOT on the mesh surface but is the geometric center of the fillet arc.
+            // These arc centers are the actual sensor path; the triangle-centroid guide path is
+            // only used to set up the cross-section planes for the circle fitting.
             List<Point3D> surfaceSamples = new(samples);
-            _lastArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
-            // The arc-center path is the sensor path translated by a single offset vector; this
-            // guarantees identical shape (so it inherits the sensor path's smoothness and stays a
-            // single convex curve) and avoids the per-sample noise that was visible before. The
-            // offset is the per-component median of (arc_center - sensor_sample) over all valid
-            // per-sample fits -- per-component median is a 50%-breakdown estimator, so wrong-
-            // direction outliers at the ends or sporadic bad fits don't bias it.
-            Vector3D arcCenterOffset = ComputeMedianArcCenterOffset(_lastArcSamples, surfaceSamples);
+            List<SensorArcSample> rawArcSamples = ComputeArcCentersForSamples(scan_, surfaceSamples, sampleNormals, spacing, diag);
 
+            // Outward direction per sample: derived from the on-surface normal + radial bias.
+            // Used for probe A/B angles; also provides the lift direction for the fallback
+            // positions used when a cross-section circle fit fails at a particular station.
             List<Vector3D> outDirs = new(samples.Count);
+            List<Point3D> liftedSamples = new(samples);
             for (Int32 i = 0; i < samples.Count; i++) {
                 Vector3D outward = ComposeOutsideDirection(sampleNormals[i], samples[i], scan_.ModelCenter, scan_.ModelAxis);
-                samples[i] = LiftSampleAlongDirection(samples[i], outward, lift, minClearance, scan_.ModelCenter, scan_.ModelAxis);
+                liftedSamples[i] = LiftSampleAlongDirection(samples[i], outward, lift, minClearance, scan_.ModelCenter, scan_.ModelAxis);
                 outDirs.Add(outward);
             }
 
-            Int32 nearestIdx = NearestSampleIndex(samples, probeAnchor_);
-            _lastFiveAxisSamples = BuildFiveAxisSamples(samples, outDirs, nearestIdx);
+            // Primary sensor positions: arc center where the Kasa fit succeeded; lifted surface
+            // position as fallback for any station where the cross-section fit failed.
+            List<Point3D> sensorPositions = new(samples.Count);
+            for (Int32 i = 0; i < samples.Count; i++) {
+                SensorArcSample sa = rawArcSamples[i];
+                sensorPositions.Add(sa.Valid && sa.Center is Point3D c ? c : liftedSamples[i]);
+            }
+
+            // Light smoothing on arc center positions to suppress per-sample Kasa fitting noise
+            // (e.g. at cross-sections where only a partial arc was captured). Endpoints are pinned
+            // so the path stays anchored at the natural fillet terminations.
+            HashSet<Int32> arcPinned = [0, sensorPositions.Count - 1];
+            sensorPositions = SmoothPathPreservingPinned(sensorPositions, smoothRadius, arcPinned);
+            sensorPositions = SmoothPathPreservingPinned(sensorPositions, smoothRadius, arcPinned);
+
+            _lastArcSamples = rawArcSamples;
+
+            Int32 nearestIdx = NearestSampleIndex(sensorPositions, probeAnchor_);
+            _lastFiveAxisSamples = BuildFiveAxisSamples(sensorPositions, outDirs, nearestIdx);
             _allSensorAxisSamples.Clear();
-            for (Int32 i = 0; i < samples.Count; i++)
-                _allSensorAxisSamples.Add(ToAxisSample(i + 1, samples[i], outDirs[i]));
+            for (Int32 i = 0; i < sensorPositions.Count; i++)
+                _allSensorAxisSamples.Add(ToAxisSample(i + 1, sensorPositions[i], outDirs[i]));
 
             if (_probeEnabled) {
-                UpdateProbeVisual(samples[nearestIdx], outDirs[nearestIdx], diag);
+                UpdateProbeVisual(sensorPositions[nearestIdx], outDirs[nearestIdx], diag);
             } else {
                 _probeXVisual.Points = [];
                 _probeYVisual.Points = [];
@@ -596,9 +612,9 @@ namespace AddFlaw.Managers {
 
             _lastPathSpacingInch = spacing;
             Point3DCollection lineSegments = [];
-            AddPolylineAsSegments(lineSegments, samples);
+            AddPolylineAsSegments(lineSegments, sensorPositions);
             Point3DCollection pointCollection = [];
-            foreach (Point3D p in samples)
+            foreach (Point3D p in sensorPositions)
                 pointCollection.Add(p);
 
             _pathActiveLine = [];
@@ -612,28 +628,11 @@ namespace AddFlaw.Managers {
             _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
             _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
 
-            // Arc-center path: sensor path translated by the global median offset vector. Same
-            // shape, same smoothness as the sensor path (which is the user's expectation -- a
-            // single convex curve, not a per-sample fit). The per-sample dots and radii lines are
-            // intentionally left blank.
-            Point3DCollection arcCenterPath = [];
-            if (arcCenterOffset.LengthSquared > 1e-18 && samples.Count >= 2) {
-                List<Point3D> arcPts = new(samples.Count);
-                for (Int32 i = 0; i < samples.Count; i++) arcPts.Add(samples[i] + arcCenterOffset);
-                AddPolylineAsSegments(arcCenterPath, arcPts);
-                // Overwrite the cached per-sample arc samples so CSV export and any downstream
-                // consumers see the smoothed translated curve, not the noisy per-sample cloud.
-                List<SensorArcSample> translated = new(samples.Count);
-                Double radius = arcCenterOffset.Length;
-                for (Int32 i = 0; i < samples.Count; i++)
-                    translated.Add(new SensorArcSample(i + 1, samples[i] + arcCenterOffset, radius, true));
-                _lastArcSamples = translated;
-            } else {
-                _lastArcSamples = [];
-            }
+            // Arc center positions are now the primary path visual above. The secondary arc-center
+            // path overlay is cleared to avoid a confusing duplicate.
             _arcCenterVisual.Points = [];
             _arcRadiusVisual.Points = [];
-            _arcCenterPathVisual.Points = arcCenterPath;
+            _arcCenterPathVisual.Points = [];
             return lineSegments.Count >= 2;
         }
 
