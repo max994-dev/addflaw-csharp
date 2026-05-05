@@ -526,7 +526,15 @@ namespace AddFlaw.Managers {
             if (centers_.Count < 2 || normals_.Count != centers_.Count) return false;
             if (scan_.MeshSlots.Count == 0) return false;
 
-            HashSet<Int32> arcTris = CollectArcTriangles(scan_, centers_);
+            Rect3D bounds = scan_.MeshSlots[0].OwnerModel.Bounds;
+            Double diag = Math.Sqrt((bounds.SizeX * bounds.SizeX) + (bounds.SizeY * bounds.SizeY) + (bounds.SizeZ * bounds.SizeZ));
+            Double spacing = Math.Max(0.01, spacingInch_);
+            // Tube radius around the start→mid→end guide polyline. Curvy triangles outside
+            // this tube are excluded so the highlight stays along the user's chosen direction
+            // and does not wrap around the entire fillet. Sized to a few sample-spacings so a
+            // local fillet cross-section fits comfortably inside.
+            Double tubeRadius = Math.Max(spacing * 4.0, diag * 0.01);
+            HashSet<Int32> arcTris = CollectArcTriangles(scan_, centers_, tubeRadius);
             if (arcTris.Count == 0) return false;
 
             Color arcColor = Color.FromArgb(0xCC, 0xFF, 0x40, 0x80);
@@ -550,7 +558,7 @@ namespace AddFlaw.Managers {
             _lastArcSamples = [];
             _lastFiveAxisSamples = [];
             _allSensorAxisSamples.Clear();
-            _lastPathSpacingInch = Math.Max(0.01, spacingInch_);
+            _lastPathSpacingInch = spacing;
 
             _ = probeAnchor_;
             _ = middleAnchorIndex_;
@@ -558,43 +566,56 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// Walk the mesh adjacency starting from each guide-path triangle, accepting only
-        /// curvy triangles into the result and only crossing into curvy neighbours. The result
-        /// is the connected fillet/arc surface around the user's path. Flat hub or blade
-        /// triangles fail the curvy test and so the BFS stops at the fillet boundary.
+        /// Collect curvy fillet triangles inside a tube of radius <paramref name="tubeRadius_"/>
+        /// around the start→mid→end guide polyline. A triangle is included only if (1) its
+        /// face has high curvature (a neighbour normal differs by &gt; 8 deg) AND (2) its
+        /// centroid lies inside the tube (its perpendicular distance to the closest segment
+        /// of the guide polyline is within tubeRadius). The directional constraint comes from
+        /// the polyline itself: triangles outside the tube along the direction the user chose
+        /// are excluded, so the highlight does not wrap around unrelated parts of the fillet.
         /// </summary>
         private static HashSet<Int32> CollectArcTriangles(
             ModelPartScanner.ScanResult scan_,
-            List<Point3D> guidePathPoints_) {
+            List<Point3D> guidePathPoints_,
+            Double tubeRadius_) {
             HashSet<Int32> result = [];
             Int32 nTri = scan_.TriCenters.Count;
             if (nTri == 0 || scan_.TriAdjacency.Count != nTri || scan_.TriNormals.Count != nTri)
                 return result;
+            if (guidePathPoints_.Count < 2 || tubeRadius_ <= 0) return result;
             Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
+            Double tubeR2 = tubeRadius_ * tubeRadius_;
 
-            HashSet<Int32> seeds = [];
-            foreach (Point3D p in guidePathPoints_) {
-                Int32 t = FindNearestTriangle(scan_, p);
-                if (t >= 0 && IsTriangleCurvy(scan_, t, cosCurvyThresh)) _ = seeds.Add(t);
-            }
-            if (seeds.Count == 0) return result;
-
-            Queue<Int32> bfs = new();
-            foreach (Int32 s in seeds) {
-                if (result.Add(s)) bfs.Enqueue(s);
-            }
-            while (bfs.Count > 0) {
-                Int32 t = bfs.Dequeue();
-                if (t >= scan_.TriAdjacency.Count) continue;
-                foreach (Int32 nbr in scan_.TriAdjacency[t]) {
-                    if (nbr < 0 || nbr >= nTri) continue;
-                    if (result.Contains(nbr)) continue;
-                    if (!IsTriangleCurvy(scan_, nbr, cosCurvyThresh)) continue;
-                    _ = result.Add(nbr);
-                    bfs.Enqueue(nbr);
-                }
+            for (Int32 t = 0; t < nTri; t++) {
+                if (!IsTriangleCurvy(scan_, t, cosCurvyThresh)) continue;
+                Point3D c = scan_.TriCenters[t];
+                if (SquaredDistanceToPolyline(c, guidePathPoints_) <= tubeR2)
+                    _ = result.Add(t);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Squared distance from a 3D point to a polyline (taken as the minimum squared
+        /// distance to any of its segments). Each segment distance is computed by projecting
+        /// the point onto the segment, clamping the projection parameter to [0, 1], and
+        /// measuring the residual perpendicular distance.
+        /// </summary>
+        private static Double SquaredDistanceToPolyline(Point3D p_, IReadOnlyList<Point3D> poly_) {
+            Double best = Double.MaxValue;
+            for (Int32 i = 0; i < poly_.Count - 1; i++) {
+                Point3D a = poly_[i];
+                Vector3D ab = poly_[i + 1] - a;
+                Vector3D ap = p_ - a;
+                Double abLen2 = ab.LengthSquared;
+                Double t = abLen2 > 1e-18 ? Vector3D.DotProduct(ap, ab) / abLen2 : 0.0;
+                if (t < 0.0) t = 0.0;
+                else if (t > 1.0) t = 1.0;
+                Vector3D resid = ap - (ab * t);
+                Double d2 = resid.LengthSquared;
+                if (d2 < best) best = d2;
+            }
+            return best;
         }
 
         /// <summary>
