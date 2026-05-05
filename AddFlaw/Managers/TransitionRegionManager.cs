@@ -599,10 +599,19 @@ namespace AddFlaw.Managers {
             // behind the start vertex (in the direction opposite the next polyline vertex)
             // or past the end vertex (in the direction past the previous polyline vertex)
             // is rejected. This keeps the highlight strictly between the two click points.
+            //
+            // The cap direction must be a STABLE displacement -- the immediate-next vertex is
+            // typically the centroid of the triangle the click landed on, so subtracting them
+            // gives a tiny, numerically-noisy vector whose normalised direction depends on
+            // arbitrary intra-triangle click position. Using a lookahead a few vertices deeper
+            // gives a stable path-direction vector that does not flip with sub-mm click noise.
             Point3D startPt = guidePathPoints_[0];
             Point3D endPt = guidePathPoints_[guidePathPoints_.Count - 1];
-            Vector3D startForward = guidePathPoints_[1] - startPt;
-            Vector3D endBackward = guidePathPoints_[guidePathPoints_.Count - 2] - endPt;
+            Int32 polyN = guidePathPoints_.Count;
+            Int32 startAheadIdx = Math.Min(polyN - 1, Math.Max(2, polyN / 8));
+            Int32 endBehindIdx = Math.Max(0, Math.Min(polyN - 3, polyN - 1 - Math.Max(2, polyN / 8)));
+            Vector3D startForward = guidePathPoints_[startAheadIdx] - startPt;
+            Vector3D endBackward = guidePathPoints_[endBehindIdx] - endPt;
             Boolean haveStartCap = startForward.LengthSquared > 1e-18;
             Boolean haveEndCap = endBackward.LengthSquared > 1e-18;
             if (haveStartCap) startForward.Normalize();
