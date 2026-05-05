@@ -621,12 +621,27 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// For each on-surface sample, fit the local fillet cross-section circle and return its 3D
-        /// center + radius. The cross-section plane at sample i is the plane perpendicular to the
-        /// path tangent at i; we project nearby triangle centers (those whose distance along the
-        /// path-tangent axis is within a thin band) onto the (binormal, normal) basis at the sample
-        /// and run a Kasa algebraic least-squares circle fit. The result is the orange center +
-        /// green radius from the user-supplied screenshot, one per sensor sample.
+        /// For each on-surface sample, fit the local arc-shape cross-section of the surface and
+        /// return its 3D center + radius. Works for both concave fillets (center floats outward
+        /// from the part, like the inside corner in the first reference image) and convex rounded
+        /// edges (center sits inside the part, like a blade leading edge):
+        ///
+        ///   1. At sample i, build a local frame: T = path tangent, N = outward surface normal,
+        ///      B = N x T (in-plane across-spine direction), N2 = T x B (re-orthogonalised normal).
+        ///   2. BFS through mesh adjacency starting at the triangle nearest to the sample,
+        ///      keeping only triangles within search-radius of the sample. This is the critical
+        ///      change that prevents triangles from a *different* surface (other side of the
+        ///      blade, hub interior, opposite blade, etc.) from polluting the fit -- a brute-force
+        ///      3D-distance scan picks them up because they happen to be physically close, even
+        ///      though they are nowhere near this sample on the surface.
+        ///   3. From the connected local patch, keep triangle centres lying inside the thin
+        ///      cross-section slab (|along T| <= band). Project them onto the (B, N2) basis.
+        ///   4. Kasa algebraic LSQ circle fit in 2D.
+        ///   5. Lift center back to 3D: C = P + a B + b N2. The sign of b is *not* constrained --
+        ///      concave fits give b > 0 (center on the outward side), convex fits give b &lt; 0
+        ///      (center inside the part). Both are accepted as long as the fit is geometrically
+        ///      consistent (residual small, center roughly perpendicular to the cross-section
+        ///      tangent, radius in a plausible range).
         /// </summary>
         private static List<SensorArcSample> ComputeArcCentersForSamples(
             ModelPartScanner.ScanResult scan_,
@@ -636,24 +651,27 @@ namespace AddFlaw.Managers {
             Double modelDiag_) {
             Int32 nSamples = samples_.Count;
             List<SensorArcSample> result = new(nSamples);
-            if (nSamples < 2 || sampleNormals_.Count != nSamples || scan_.TriCenters.Count == 0) {
+            if (nSamples < 2 || sampleNormals_.Count != nSamples || scan_.TriCenters.Count == 0
+                || scan_.TriAdjacency.Count != scan_.TriCenters.Count) {
                 for (Int32 i = 0; i < nSamples; i++)
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                 return result;
             }
 
-            // Search box. Proportional to point spacing so the cross-section width adapts when the
-            // user changes Point Spacing, with a model-scale floor so it still works on very fine
-            // spacings. The radius cap rejects implausibly huge "arcs" coming from near-flat regions.
-            Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.05);
+            // Local-patch box. Proportional to point spacing so the cross-section width adapts as
+            // the user changes Point Spacing, with a model-scale floor for very fine spacings.
+            Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.04);
             Double searchRadius2 = searchRadius * searchRadius;
-            Double bandThickness = Math.Max(spacingInch_ * 1.0, modelDiag_ * 0.005);
-            Double minPlausibleR = Math.Max(spacingInch_ * 0.5, modelDiag_ * 0.0005);
-            Double maxPlausibleR = searchRadius * 2.0;
+            Double bandThickness = Math.Max(spacingInch_ * 1.5, modelDiag_ * 0.006);
+            Double minPlausibleR = Math.Max(spacingInch_ * 0.25, modelDiag_ * 0.0003);
+            Double maxPlausibleR = Math.Max(searchRadius * 4.0, modelDiag_ * 0.5);
 
             IReadOnlyList<Point3D> triCenters = scan_.TriCenters;
+            IReadOnlyList<IReadOnlyList<Int32>> triAdj = scan_.TriAdjacency;
             Int32 nTri = triCenters.Count;
-            List<(Double x, Double y)> cs = new(64);
+            List<(Double x, Double y)> cs = new(128);
+            HashSet<Int32> visited = new(256);
+            Queue<Int32> bfs = new(256);
 
             for (Int32 i = 0; i < nSamples; i++) {
                 Point3D P = samples_[i];
@@ -663,8 +681,12 @@ namespace AddFlaw.Managers {
                     continue;
                 }
                 N.Normalize();
+                // Flip N if it disagrees with the radial-outward direction from the model spin
+                // axis. Handles STL files with inverted face winding without forcing every fit
+                // to silently fail on a bad-side check.
+                Vector3D radialOut = ComputeRadialOutward(P, scan_.ModelCenter, scan_.ModelAxis);
+                if (Vector3D.DotProduct(N, radialOut) < 0) N = -N;
 
-                // Path tangent from neighbors (use the symmetric difference where possible).
                 Int32 prev = Math.Max(0, i - 1);
                 Int32 next = Math.Min(nSamples - 1, i + 1);
                 Vector3D T = samples_[next] - samples_[prev];
@@ -674,14 +696,12 @@ namespace AddFlaw.Managers {
                 }
                 T.Normalize();
 
-                // Binormal: across-spine direction, lying in the cross-section plane along the surface.
                 Vector3D B = Vector3D.CrossProduct(N, T);
                 if (B.LengthSquared < 1e-18) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
                 B.Normalize();
-                // Re-orthogonalize the in-plane "outward" direction so (B, N2) is exactly orthonormal.
                 Vector3D N2 = Vector3D.CrossProduct(T, B);
                 if (N2.LengthSquared < 1e-18) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
@@ -690,32 +710,67 @@ namespace AddFlaw.Managers {
                 N2.Normalize();
                 if (Vector3D.DotProduct(N2, N) < 0) N2 = -N2;
 
+                Int32 startTri = FindNearestTriangle(scan_, P);
+                if (startTri < 0) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+
+                // BFS through mesh adjacency, restricted to the search radius. Triangles get added
+                // to the cross-section list only if they fall inside the thin band along T, but BFS
+                // expansion still walks through *any* in-radius triangle so the band can be reached
+                // even when the path of in-band triangles isn't directly adjacent.
                 cs.Clear();
-                cs.Add((0, 0)); // sample itself sits at the origin of the (B, N2) basis.
-                for (Int32 t = 0; t < nTri; t++) {
+                visited.Clear();
+                bfs.Clear();
+                cs.Add((0, 0));
+                _ = visited.Add(startTri);
+                bfs.Enqueue(startTri);
+
+                while (bfs.Count > 0) {
+                    Int32 t = bfs.Dequeue();
                     Vector3D d = triCenters[t] - P;
-                    Double along = Vector3D.DotProduct(d, T);
-                    if (Math.Abs(along) > bandThickness) continue;
                     if (d.LengthSquared > searchRadius2) continue;
-                    Double bx = Vector3D.DotProduct(d, B);
-                    Double ny = Vector3D.DotProduct(d, N2);
-                    cs.Add((bx, ny));
+                    if (t != startTri) {
+                        Double along = Vector3D.DotProduct(d, T);
+                        if (Math.Abs(along) <= bandThickness) {
+                            Double bx = Vector3D.DotProduct(d, B);
+                            Double ny = Vector3D.DotProduct(d, N2);
+                            cs.Add((bx, ny));
+                        }
+                    }
+                    if (t >= triAdj.Count) continue;
+                    foreach (Int32 nbr in triAdj[t]) {
+                        if (nbr < 0 || nbr >= nTri) continue;
+                        if (visited.Add(nbr)) bfs.Enqueue(nbr);
+                    }
                 }
 
                 if (cs.Count < 5) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
-
                 if (!TryFitCircle2DKasa(cs, out Double a, out Double b, out Double r)) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
 
-                // Sanity: center must be on the open-space (outward-normal) side of the surface,
-                // and radius must lie in the plausible fillet-radius range. Otherwise the fit is
-                // dominated by noise or the surface is not actually arc-like at this sample.
-                if (b <= 0 || !Double.IsFinite(r) || r < minPlausibleR || r > maxPlausibleR) {
+                // Sanity:
+                //   * radius must be plausible
+                //   * center must lie roughly along the cross-section normal axis (|a| << r),
+                //     so degenerate fits where points form a tilted line don't sneak through
+                //   * mean radial residual must be small relative to r (the cross-section was
+                //     actually arc-shaped, not flat or polylinear)
+                if (!Double.IsFinite(r) || r < minPlausibleR || r > maxPlausibleR) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                if (Math.Abs(a) > r * 1.2) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                Double residual = MeanCircleResidual(cs, a, b, r);
+                if (residual > r * 0.30) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
@@ -724,6 +779,17 @@ namespace AddFlaw.Managers {
                 result.Add(new SensorArcSample(i + 1, center3d, r, true));
             }
             return result;
+        }
+
+        private static Double MeanCircleResidual(IReadOnlyList<(Double x, Double y)> pts_, Double a_, Double b_, Double r_) {
+            if (pts_.Count == 0) return 0;
+            Double sum = 0;
+            foreach ((Double x, Double y) in pts_) {
+                Double dx = x - a_;
+                Double dy = y - b_;
+                sum += Math.Abs(Math.Sqrt((dx * dx) + (dy * dy)) - r_);
+            }
+            return sum / pts_.Count;
         }
 
         /// <summary>
