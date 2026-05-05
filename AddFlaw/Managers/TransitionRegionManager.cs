@@ -660,34 +660,20 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// For each on-surface sample, fit the local arc-shape cross-section of the surface and
-        /// return its 3D center + radius. Works for both concave fillets (center floats outward
-        /// from the part, like the inside corner in the first reference image) and convex rounded
-        /// edges (center sits inside the part, like a blade leading edge):
+        /// For each on-surface sample, find the midpoint of the fillet arc at that cross-section
+        /// and return it as a 3D point that lies ON the arc surface. This is the angular centre
+        /// of the arc -- not the centre of the circle the arc belongs to.
         ///
         ///   1. At sample i, build a local frame: T = path tangent, N = outward surface normal,
         ///      B = N x T (in-plane across-spine direction), N2 = T x B (re-orthogonalised normal).
-        ///   2. BFS through mesh adjacency starting at the triangle nearest to the sample, keeping
-        ///      only triangles within search-radius. This restricts the gather to the locally
-        ///      connected mesh patch and prevents triangles from a *different* surface (other
-        ///      side of the blade, hub interior, opposite blade) from polluting the fit.
-        ///   3. From the connected local patch, drop *flat* triangles -- a triangle counts only
-        ///      if at least one of its mesh neighbours has a normal differing by more than 8 deg.
-        ///      Flat hub/blade-side triangles surrounding the fillet would otherwise contribute
-        ///      points that flatten the circle fit (giving a tiny artefact radius) even though
-        ///      they're far from the actual fillet arc.
-        ///   4. Compute the *exact* cross-section curve: for each surviving curvy triangle,
-        ///      intersect its three edges with the cross-section plane (point P, normal T) and
-        ///      append the crossing points (0, 1, or 2 per triangle) to the 2D point cloud after
-        ///      projecting onto the (B, N2) basis. This is independent of any band-thickness
-        ///      tolerance: the cross-section is the exact polyline the plane cuts through the
-        ///      mesh, so we get a clean, dense set of points on the actual fillet arc.
-        ///   5. Kasa algebraic LSQ circle fit in 2D.
-        ///   6. Lift center back to 3D: C = P + a B + b N2. The sign of b is *not* constrained --
-        ///      concave fits give b > 0 (center on the outward side), convex fits give b &lt; 0
-        ///      (center inside the part). Both are accepted as long as the fit is geometrically
-        ///      consistent (residual small, center roughly perpendicular to the cross-section
-        ///      tangent, radius in a plausible range).
+        ///   2. BFS through mesh adjacency to gather the locally connected mesh patch within the
+        ///      search radius, keeping only curvy triangles (neighbours differ by &gt; 8 deg).
+        ///   3. Intersect each curvy triangle's edges with the cross-section plane (P, T) and
+        ///      project the crossing points onto the 2D (B, N2) basis.
+        ///   4. Sort the 2D points by angle around their centroid. The largest angular gap marks
+        ///      the region where the fillet arc ends. The point at the median index of the arc
+        ///      segment is the arc midpoint -- a point that IS on the fillet surface.
+        ///   5. Lift back to 3D: arc_mid = P + mx * B + my * N2.
         /// </summary>
         private static List<SensorArcSample> ComputeArcCentersForSamples(
             ModelPartScanner.ScanResult scan_,
@@ -709,8 +695,6 @@ namespace AddFlaw.Managers {
             // BFS wraps around to unrelated parts of the same connected component.
             Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.03);
             Double searchRadius2 = searchRadius * searchRadius;
-            Double minPlausibleR = Math.Max(spacingInch_ * 0.25, modelDiag_ * 0.0003);
-            Double maxPlausibleR = Math.Max(searchRadius * 6.0, modelDiag_ * 0.6);
             // Curvy-triangle threshold: 8 deg between neighbour normals.
             Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
 
@@ -791,75 +775,42 @@ namespace AddFlaw.Managers {
                     }
                 }
 
-                if (cs.Count < 5) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-                if (!TryFitCircle2DKasa(cs, out Double a, out Double b, out Double r)) {
+                if (cs.Count < 3) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
 
-                // Iterative refit: drop points whose distance from the fitted center is outside
-                // [innerKeep * r, outerKeep * r], then refit. This sheds outliers (transitional
-                // triangles at the ends of the fillet, stragglers from across-band geometry) that
-                // were curvy enough to survive the per-triangle filter but don't lie on the actual
-                // cross-section arc. Two passes converge in practice.
-                List<(Double x, Double y)> refit = new(cs.Count);
-                for (Int32 pass = 0; pass < 2; pass++) {
-                    Double rPrev = r;
-                    Double inner = r * 0.55;
-                    Double outer = r * 1.45;
-                    Double inner2 = inner * inner;
-                    Double outer2 = outer * outer;
-                    refit.Clear();
-                    foreach ((Double x, Double y) in cs) {
-                        Double dx = x - a;
-                        Double dy = y - b;
-                        Double d2 = (dx * dx) + (dy * dy);
-                        if (d2 >= inner2 && d2 <= outer2) refit.Add((x, y));
-                    }
-                    if (refit.Count < 5) break;
-                    if (!TryFitCircle2DKasa(refit, out Double a2, out Double b2, out Double r2)) break;
-                    if (!Double.IsFinite(r2) || r2 < minPlausibleR || r2 > maxPlausibleR) break;
-                    a = a2; b = b2; r = r2;
-                    cs = new List<(Double x, Double y)>(refit);
-                    if (Math.Abs(r - rPrev) < r * 0.005) break;
+                // Find the midpoint of the fillet arc among the cross-section points.
+                // Sort by angle around the centroid of the points. The largest angular gap between
+                // consecutive sorted angles is the region where no fillet geometry exists (the
+                // "outside" of the arc). The arc segment starts right after that gap; the point at
+                // the median index of the arc segment is the arc midpoint -- a point ON the arc.
+                Int32 nPts = cs.Count;
+                Double cX = 0, cY = 0;
+                foreach ((Double x, Double y) in cs) { cX += x; cY += y; }
+                cX /= nPts;
+                cY /= nPts;
+
+                Double[] theta = new Double[nPts];
+                Int32[] order = new Int32[nPts];
+                for (Int32 j = 0; j < nPts; j++) {
+                    theta[j] = Math.Atan2(cs[j].y - cY, cs[j].x - cX);
+                    order[j] = j;
+                }
+                Array.Sort(theta, order);
+
+                Int32 gapAfterSorted = 0;
+                Double maxGap = Double.NegativeInfinity;
+                for (Int32 j = 0; j < nPts; j++) {
+                    Int32 nxt = (j + 1) % nPts;
+                    Double gap = (nxt == 0 ? theta[0] + (2.0 * Math.PI) : theta[nxt]) - theta[j];
+                    if (gap > maxGap) { maxGap = gap; gapAfterSorted = j; }
                 }
 
-                // Sanity:
-                //   * radius must be plausible
-                //   * center must lie roughly along the cross-section normal axis (|a| << r),
-                //     so degenerate fits where points form a tilted line don't sneak through
-                //   * mean radial residual must be small relative to r (the cross-section was
-                //     actually arc-shaped, not flat or polylinear)
-                if (!Double.IsFinite(r) || r < minPlausibleR || r > maxPlausibleR) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-                if (Math.Abs(a) > r * 1.2) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-                // Side check: for a concave fillet the center lies on the *outward* side of the
-                // surface, i.e. positive b in the (B, N2) frame where N2 is aligned with the
-                // outward normal. Allow a small negative tolerance for numerical noise but reject
-                // fits that lock onto a fundamentally convex cross-section -- those are typically
-                // produced at the path endpoints where the fillet transitions onto an edge or
-                // a flat surface and would otherwise drag the smoothed centerline in the wrong
-                // direction.
-                if (b < -r * 0.05) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-                Double residual = MeanCircleResidual(cs, a, b, r);
-                if (residual > r * 0.20) {
-                    result.Add(new SensorArcSample(i + 1, null, 0, false));
-                    continue;
-                }
-
-                Point3D center3d = P + (B * a) + (N2 * b);
-                result.Add(new SensorArcSample(i + 1, center3d, r, true));
+                Int32 arcStartSorted = (gapAfterSorted + 1) % nPts;
+                (Double mx, Double my) = cs[order[(arcStartSorted + (nPts / 2)) % nPts]];
+                Point3D arcMid3D = P + (B * mx) + (N2 * my);
+                result.Add(new SensorArcSample(i + 1, arcMid3D, 0, true));
             }
             return result;
         }
