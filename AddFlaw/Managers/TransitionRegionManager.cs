@@ -529,12 +529,20 @@ namespace AddFlaw.Managers {
             Rect3D bounds = scan_.MeshSlots[0].OwnerModel.Bounds;
             Double diag = Math.Sqrt((bounds.SizeX * bounds.SizeX) + (bounds.SizeY * bounds.SizeY) + (bounds.SizeZ * bounds.SizeZ));
             Double spacing = Math.Max(0.01, spacingInch_);
-            // Tube radius around the start→mid→end guide polyline. Curvy triangles outside
-            // this tube are excluded so the highlight stays along the user's chosen direction
-            // and does not wrap around the entire fillet. Sized to a few sample-spacings so a
-            // local fillet cross-section fits comfortably inside.
-            Double tubeRadius = Math.Max(spacing * 4.0, diag * 0.01);
-            HashSet<Int32> arcTris = CollectArcTriangles(scan_, centers_, tubeRadius);
+
+            // Tube polyline that bounds the arc highlight: starts at the user's start-click,
+            // walks through the centroid-aligned interior, and ends at the user's end-click.
+            // Anchoring on the click positions keeps the highlight strictly between the two
+            // clicked points instead of running off into the rest of the connected fillet.
+            List<Point3D> tubePolyline = new(centers_.Count + 2) { _cachedStartClick };
+            tubePolyline.AddRange(centers_);
+            tubePolyline.Add(_cachedEndClick);
+
+            // Tube radius defines the half-width of the highlighted "belt"; smaller = tighter
+            // strip. Sized to a few sample-spacings so a typical fillet cross-section fits
+            // inside while distant curvy triangles on the same fillet ring stay excluded.
+            Double tubeRadius = Math.Max(spacing * 3.0, diag * 0.006);
+            HashSet<Int32> arcTris = CollectArcTriangles(scan_, tubePolyline, tubeRadius);
             if (arcTris.Count == 0) return false;
 
             Color arcColor = Color.FromArgb(0xCC, 0xFF, 0x40, 0x80);
@@ -566,13 +574,14 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// Collect curvy fillet triangles inside a tube of radius <paramref name="tubeRadius_"/>
-        /// around the start→mid→end guide polyline. A triangle is included only if (1) its
-        /// face has high curvature (a neighbour normal differs by &gt; 8 deg) AND (2) its
-        /// centroid lies inside the tube (its perpendicular distance to the closest segment
-        /// of the guide polyline is within tubeRadius). The directional constraint comes from
-        /// the polyline itself: triangles outside the tube along the direction the user chose
-        /// are excluded, so the highlight does not wrap around unrelated parts of the fillet.
+        /// Collect curvy fillet triangles inside a CAPPED tube of radius
+        /// <paramref name="tubeRadius_"/> around the polyline. A triangle is included only if
+        /// it (1) is curvy (a neighbour normal differs by &gt; 8 deg), (2) lies inside the
+        /// tube (perpendicular distance to closest segment within tubeRadius), AND (3) is on
+        /// the inside of perpendicular caps placed at the polyline's first and last vertex.
+        /// The caps reject triangles that fall behind the start vertex or past the end vertex,
+        /// so the highlight is strictly bounded by the start/end clicks instead of bulging
+        /// into the surrounding fillet at the endpoints.
         /// </summary>
         private static HashSet<Int32> CollectArcTriangles(
             ModelPartScanner.ScanResult scan_,
@@ -586,9 +595,24 @@ namespace AddFlaw.Managers {
             Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
             Double tubeR2 = tubeRadius_ * tubeRadius_;
 
+            // Perpendicular caps at the polyline endpoints: a triangle whose centroid sits
+            // behind the start vertex (in the direction opposite the next polyline vertex)
+            // or past the end vertex (in the direction past the previous polyline vertex)
+            // is rejected. This keeps the highlight strictly between the two click points.
+            Point3D startPt = guidePathPoints_[0];
+            Point3D endPt = guidePathPoints_[guidePathPoints_.Count - 1];
+            Vector3D startForward = guidePathPoints_[1] - startPt;
+            Vector3D endBackward = guidePathPoints_[guidePathPoints_.Count - 2] - endPt;
+            Boolean haveStartCap = startForward.LengthSquared > 1e-18;
+            Boolean haveEndCap = endBackward.LengthSquared > 1e-18;
+            if (haveStartCap) startForward.Normalize();
+            if (haveEndCap) endBackward.Normalize();
+
             for (Int32 t = 0; t < nTri; t++) {
                 if (!IsTriangleCurvy(scan_, t, cosCurvyThresh)) continue;
                 Point3D c = scan_.TriCenters[t];
+                if (haveStartCap && Vector3D.DotProduct(c - startPt, startForward) < 0) continue;
+                if (haveEndCap && Vector3D.DotProduct(c - endPt, endBackward) < 0) continue;
                 if (SquaredDistanceToPolyline(c, guidePathPoints_) <= tubeR2)
                     _ = result.Add(t);
             }
