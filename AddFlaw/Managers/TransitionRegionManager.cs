@@ -775,30 +775,55 @@ namespace AddFlaw.Managers {
                     }
                 }
 
+                if (cs.Count < 5) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+                if (!TryFitCircle2DKasa(cs, out Double a, out Double b, out Double r)) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
+
+                // Iterative refit: remove points not on the main arc so the circle-center
+                // reference used for angle computation below stays on the fillet and is not
+                // pulled by stray points from adjacent flat or unrelated surfaces.
+                List<(Double x, Double y)> refitPts = new(cs.Count);
+                for (Int32 pass = 0; pass < 2; pass++) {
+                    Double inner2 = (r * 0.55) * (r * 0.55);
+                    Double outer2 = (r * 1.45) * (r * 1.45);
+                    refitPts.Clear();
+                    foreach ((Double x, Double y) in cs) {
+                        Double d2 = ((x - a) * (x - a)) + ((y - b) * (y - b));
+                        if (d2 >= inner2 && d2 <= outer2) refitPts.Add((x, y));
+                    }
+                    if (refitPts.Count < 5) break;
+                    if (!TryFitCircle2DKasa(refitPts, out Double a2, out Double b2, out Double r2)) break;
+                    if (!Double.IsFinite(r2) || r2 <= 0) break;
+                    Double rPrev = r;
+                    a = a2; b = b2; r = r2;
+                    cs = new List<(Double x, Double y)>(refitPts);
+                    if (Math.Abs(r - rPrev) < r * 0.005) break;
+                }
                 if (cs.Count < 3) {
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                     continue;
                 }
 
-                // Find the midpoint of the fillet arc among the cross-section points.
-                // Sort by angle around the centroid of the points. The largest angular gap between
-                // consecutive sorted angles is the region where no fillet geometry exists (the
-                // "outside" of the arc). The arc segment starts right after that gap; the point at
-                // the median index of the arc segment is the arc midpoint -- a point ON the arc.
+                // Compute angle of each arc point relative to the stable Kasa circle center
+                // (a, b). Using the fitted center -- NOT the centroid of the points -- is the
+                // key: the centroid shifts as the distribution of points changes between cross-
+                // sections, which causes gapAfterSorted to flip sides and the selected midpoint
+                // to zigzag. The Kasa center is invariant to that distribution noise.
                 Int32 nPts = cs.Count;
-                Double cX = 0, cY = 0;
-                foreach ((Double x, Double y) in cs) { cX += x; cY += y; }
-                cX /= nPts;
-                cY /= nPts;
-
                 Double[] theta = new Double[nPts];
                 Int32[] order = new Int32[nPts];
                 for (Int32 j = 0; j < nPts; j++) {
-                    theta[j] = Math.Atan2(cs[j].y - cY, cs[j].x - cX);
+                    theta[j] = Math.Atan2(cs[j].y - b, cs[j].x - a);
                     order[j] = j;
                 }
                 Array.Sort(theta, order);
 
+                // Largest angular gap = empty region between the two ends of the fillet arc.
                 Int32 gapAfterSorted = 0;
                 Double maxGap = Double.NegativeInfinity;
                 for (Int32 j = 0; j < nPts; j++) {
@@ -806,7 +831,16 @@ namespace AddFlaw.Managers {
                     Double gap = (nxt == 0 ? theta[0] + (2.0 * Math.PI) : theta[nxt]) - theta[j];
                     if (gap > maxGap) { maxGap = gap; gapAfterSorted = j; }
                 }
+                // Reject cross-sections where the gap is too small (< ~60°): this indicates
+                // a nearly complete circle (not a fillet arc) or a degenerate clustering.
+                if (maxGap < Math.PI / 3.0) {
+                    result.Add(new SensorArcSample(i + 1, null, 0, false));
+                    continue;
+                }
 
+                // Arc midpoint: the actual cross-section point at the median angular position
+                // in the arc segment. This point came from a mesh-edge intersection, so it
+                // lies exactly ON the fillet surface -- not offset from it.
                 Int32 arcStartSorted = (gapAfterSorted + 1) % nPts;
                 (Double mx, Double my) = cs[order[(arcStartSorted + (nPts / 2)) % nPts]];
                 Point3D arcMid3D = P + (B * mx) + (N2 * my);
