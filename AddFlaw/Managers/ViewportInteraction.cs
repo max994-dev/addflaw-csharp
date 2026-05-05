@@ -28,10 +28,8 @@ namespace AddFlaw.Managers {
         /// A tuple: (hitFound, hitPosition). If no valid model is hit, returns (false, null).
         /// </returns>
         public (Boolean, Point3D?) Get3DPointInModel(Point mousePos_, ModelManager modelManager_) {
-            Ray3D? ray = Viewport3DHelper.GetRay(_viewport.Viewport, mousePos_);
             var hits = Viewport3DHelper.FindHits(_viewport.Viewport, mousePos_);
-            
-            if (hits.Count < 0)
+            if (hits is null || hits.Count == 0)
                 return (false, null);
             PointHitResult? hit = hits.FirstOrDefault();
             if ((hit is null) || (hit.Model is null) || (!modelManager_.ContainsModel(hit.Model)))
@@ -50,10 +48,8 @@ namespace AddFlaw.Managers {
         /// A tuple: (hitFound, hitPosition, flawMarker). If no flaw is hit, returns (false, null, null).
         /// </returns>
         public (Boolean, Point3D?, FlawMarker?) Get3DPointInFlaws(Point mousePos_, ModelManager modelManager_, FlawManager flawManager_) {
-            Ray3D? ray = Viewport3DHelper.GetRay(_viewport.Viewport, mousePos_);
             var hits = Viewport3DHelper.FindHits(_viewport.Viewport, mousePos_);
-
-            if (hits.Count < 0)
+            if (hits is null || hits.Count == 0)
                 return (false, null, null);
 
             while (hits.Count > 0) {

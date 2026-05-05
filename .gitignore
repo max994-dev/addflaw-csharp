@@ -22,3 +22,6 @@ _ReSharper*/
 *.tmp
 *.temp
 
+# Packaged archives
+app.rar
+

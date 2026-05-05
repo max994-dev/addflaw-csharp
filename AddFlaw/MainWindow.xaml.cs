@@ -37,11 +37,7 @@ namespace AddFlaw {
         private Int32 _linePickStep;
         private Boolean _hasDrawnTransitionLine;
         private Boolean _isLineDrawMode;
-        private Boolean _isLineDragging;
         private DateTime _lastLineDrawAt = DateTime.MinValue;
-        private DateTime _lastLineMoveSampleAt = DateTime.MinValue;
-        private Point _lastLineMousePos = new(Double.NaN, Double.NaN);
-        private Boolean _lineDragAwaitMove;
         private Boolean _showProbeEnabled;
 
         /// <summary>
@@ -93,8 +89,6 @@ namespace AddFlaw {
         /// <param name="evt_">Routed event args.</param>
         private void Viewport3D_LostFocus(Object sender_, RoutedEventArgs evt_) {
             _waitEndPoint = false;
-            _isLineDragging = false;
-            _lineDragAwaitMove = false;
             _transitionRegionManager.EndLineDragSession();
             _flawManager.CancelFlaw();
         }
@@ -336,8 +330,6 @@ namespace AddFlaw {
                     _linePickStep = 0;
                     _hasDrawnTransitionLine = false;
                     _isLineDrawMode = false;
-                    _isLineDragging = false;
-                    _lineDragAwaitMove = false;
                     _transitionRegionManager.ClearTransitionCenterline();
                     _transitionRegionManager.UpdateControlPointPreview(null, null, null);
                     if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
@@ -892,11 +884,8 @@ namespace AddFlaw {
         /// <param name="sender_">Event sender.</param>
         /// <param name="evt_">Mouse event args.</param>
         private void Viewport3D_MouseUp(Object sender_, MouseButtonEventArgs evt_) {
-            if (evt_.LeftButton == MouseButtonState.Released) {
-                _isLineDragging = false;
-                _lineDragAwaitMove = false;
+            if (evt_.LeftButton == MouseButtonState.Released)
                 _transitionRegionManager.EndLineDragSession();
-            }
         }
 
         /// <summary>
