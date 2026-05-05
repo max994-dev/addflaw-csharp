@@ -628,16 +628,23 @@ namespace AddFlaw.Managers {
         ///
         ///   1. At sample i, build a local frame: T = path tangent, N = outward surface normal,
         ///      B = N x T (in-plane across-spine direction), N2 = T x B (re-orthogonalised normal).
-        ///   2. BFS through mesh adjacency starting at the triangle nearest to the sample,
-        ///      keeping only triangles within search-radius of the sample. This is the critical
-        ///      change that prevents triangles from a *different* surface (other side of the
-        ///      blade, hub interior, opposite blade, etc.) from polluting the fit -- a brute-force
-        ///      3D-distance scan picks them up because they happen to be physically close, even
-        ///      though they are nowhere near this sample on the surface.
-        ///   3. From the connected local patch, keep triangle centres lying inside the thin
-        ///      cross-section slab (|along T| <= band). Project them onto the (B, N2) basis.
-        ///   4. Kasa algebraic LSQ circle fit in 2D.
-        ///   5. Lift center back to 3D: C = P + a B + b N2. The sign of b is *not* constrained --
+        ///   2. BFS through mesh adjacency starting at the triangle nearest to the sample, keeping
+        ///      only triangles within search-radius. This restricts the gather to the locally
+        ///      connected mesh patch and prevents triangles from a *different* surface (other
+        ///      side of the blade, hub interior, opposite blade) from polluting the fit.
+        ///   3. From the connected local patch, drop *flat* triangles -- a triangle counts only
+        ///      if at least one of its mesh neighbours has a normal differing by more than 8 deg.
+        ///      Flat hub/blade-side triangles surrounding the fillet would otherwise contribute
+        ///      points that flatten the circle fit (giving a tiny artefact radius) even though
+        ///      they're far from the actual fillet arc.
+        ///   4. Compute the *exact* cross-section curve: for each surviving curvy triangle,
+        ///      intersect its three edges with the cross-section plane (point P, normal T) and
+        ///      append the crossing points (0, 1, or 2 per triangle) to the 2D point cloud after
+        ///      projecting onto the (B, N2) basis. This is independent of any band-thickness
+        ///      tolerance: the cross-section is the exact polyline the plane cuts through the
+        ///      mesh, so we get a clean, dense set of points on the actual fillet arc.
+        ///   5. Kasa algebraic LSQ circle fit in 2D.
+        ///   6. Lift center back to 3D: C = P + a B + b N2. The sign of b is *not* constrained --
         ///      concave fits give b > 0 (center on the outward side), convex fits give b &lt; 0
         ///      (center inside the part). Both are accepted as long as the fit is geometrically
         ///      consistent (residual small, center roughly perpendicular to the cross-section
@@ -652,26 +659,28 @@ namespace AddFlaw.Managers {
             Int32 nSamples = samples_.Count;
             List<SensorArcSample> result = new(nSamples);
             if (nSamples < 2 || sampleNormals_.Count != nSamples || scan_.TriCenters.Count == 0
-                || scan_.TriAdjacency.Count != scan_.TriCenters.Count) {
+                || scan_.TriAdjacency.Count != scan_.TriCenters.Count
+                || scan_.TriNormals.Count != scan_.TriCenters.Count) {
                 for (Int32 i = 0; i < nSamples; i++)
                     result.Add(new SensorArcSample(i + 1, null, 0, false));
                 return result;
             }
 
-            // Local-patch box. Proportional to point spacing so the cross-section width adapts as
-            // the user changes Point Spacing, with a model-scale floor for very fine spacings.
-            Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.04);
+            // Local-patch radius. Generous enough to span typical fillets but not so large that
+            // BFS wraps around to unrelated parts of the same connected component.
+            Double searchRadius = Math.Max(spacingInch_ * 8.0, modelDiag_ * 0.03);
             Double searchRadius2 = searchRadius * searchRadius;
-            Double bandThickness = Math.Max(spacingInch_ * 1.5, modelDiag_ * 0.006);
             Double minPlausibleR = Math.Max(spacingInch_ * 0.25, modelDiag_ * 0.0003);
-            Double maxPlausibleR = Math.Max(searchRadius * 4.0, modelDiag_ * 0.5);
+            Double maxPlausibleR = Math.Max(searchRadius * 6.0, modelDiag_ * 0.6);
+            // Curvy-triangle threshold: 8 deg between neighbour normals.
+            Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
 
             IReadOnlyList<Point3D> triCenters = scan_.TriCenters;
             IReadOnlyList<IReadOnlyList<Int32>> triAdj = scan_.TriAdjacency;
             Int32 nTri = triCenters.Count;
-            List<(Double x, Double y)> cs = new(128);
-            HashSet<Int32> visited = new(256);
-            Queue<Int32> bfs = new(256);
+            List<(Double x, Double y)> cs = new(256);
+            HashSet<Int32> visited = new(512);
+            Queue<Int32> bfs = new(512);
 
             for (Int32 i = 0; i < nSamples; i++) {
                 Point3D P = samples_[i];
@@ -682,8 +691,7 @@ namespace AddFlaw.Managers {
                 }
                 N.Normalize();
                 // Flip N if it disagrees with the radial-outward direction from the model spin
-                // axis. Handles STL files with inverted face winding without forcing every fit
-                // to silently fail on a bad-side check.
+                // axis. Handles STL files with inverted face winding without silently failing.
                 Vector3D radialOut = ComputeRadialOutward(P, scan_.ModelCenter, scan_.ModelAxis);
                 if (Vector3D.DotProduct(N, radialOut) < 0) N = -N;
 
@@ -716,14 +724,12 @@ namespace AddFlaw.Managers {
                     continue;
                 }
 
-                // BFS through mesh adjacency, restricted to the search radius. Triangles get added
-                // to the cross-section list only if they fall inside the thin band along T, but BFS
-                // expansion still walks through *any* in-radius triangle so the band can be reached
-                // even when the path of in-band triangles isn't directly adjacent.
+                // BFS the local mesh patch within search radius. For each in-radius triangle that
+                // passes the curvy-neighbour filter, intersect its three edges with the cross-
+                // section plane and append the exact crossing points.
                 cs.Clear();
                 visited.Clear();
                 bfs.Clear();
-                cs.Add((0, 0));
                 _ = visited.Add(startTri);
                 bfs.Enqueue(startTri);
 
@@ -731,14 +737,11 @@ namespace AddFlaw.Managers {
                     Int32 t = bfs.Dequeue();
                     Vector3D d = triCenters[t] - P;
                     if (d.LengthSquared > searchRadius2) continue;
-                    if (t != startTri) {
-                        Double along = Vector3D.DotProduct(d, T);
-                        if (Math.Abs(along) <= bandThickness) {
-                            Double bx = Vector3D.DotProduct(d, B);
-                            Double ny = Vector3D.DotProduct(d, N2);
-                            cs.Add((bx, ny));
-                        }
+
+                    if (IsTriangleCurvy(scan_, t, cosCurvyThresh)) {
+                        AddTriangleCrossSectionPoints(scan_, t, P, T, B, N2, cs);
                     }
+
                     if (t >= triAdj.Count) continue;
                     foreach (Int32 nbr in triAdj[t]) {
                         if (nbr < 0 || nbr >= nTri) continue;
@@ -779,6 +782,73 @@ namespace AddFlaw.Managers {
                 result.Add(new SensorArcSample(i + 1, center3d, r, true));
             }
             return result;
+        }
+
+        /// <summary>
+        /// Curvy-triangle test: a triangle counts as curvy when at least one of its mesh-adjacent
+        /// neighbours has a face normal differing by more than the threshold (default 8 deg).
+        /// Flat hub/blade-side triangles fail this test even when they are physically close to
+        /// the fillet, so they are excluded from the cross-section circle fit.
+        /// </summary>
+        private static Boolean IsTriangleCurvy(ModelPartScanner.ScanResult scan_, Int32 tri_, Double cosThreshold_) {
+            if (tri_ < 0 || tri_ >= scan_.TriNormals.Count || tri_ >= scan_.TriAdjacency.Count) return false;
+            Vector3D nT = scan_.TriNormals[tri_];
+            if (nT.LengthSquared < 1e-18) return false;
+            nT.Normalize();
+            foreach (Int32 nbr in scan_.TriAdjacency[tri_]) {
+                if (nbr < 0 || nbr >= scan_.TriNormals.Count) continue;
+                Vector3D nNbr = scan_.TriNormals[nbr];
+                if (nNbr.LengthSquared < 1e-18) continue;
+                nNbr.Normalize();
+                if (Vector3D.DotProduct(nT, nNbr) < cosThreshold_) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Append the exact intersection points of a triangle with the cross-section plane
+        /// (defined by point planePoint_ and normal planeNormal_), projected onto the
+        /// (basisB_, basisN_) 2D frame. Each triangle contributes 0 (no crossing), 1 (vertex
+        /// touch), or 2 (a chord) crossing points.
+        /// </summary>
+        private static void AddTriangleCrossSectionPoints(
+            ModelPartScanner.ScanResult scan_,
+            Int32 globalTri_,
+            Point3D planePoint_,
+            Vector3D planeNormal_,
+            Vector3D basisB_,
+            Vector3D basisN_,
+            List<(Double x, Double y)> cs_) {
+            if (!TryGetTriangleVertices(scan_, globalTri_, out Point3D p0, out Point3D p1, out Point3D p2)) return;
+            AddEdgeCrossSection(p0, p1, planePoint_, planeNormal_, basisB_, basisN_, cs_);
+            AddEdgeCrossSection(p1, p2, planePoint_, planeNormal_, basisB_, basisN_, cs_);
+            AddEdgeCrossSection(p2, p0, planePoint_, planeNormal_, basisB_, basisN_, cs_);
+        }
+
+        private static void AddEdgeCrossSection(
+            Point3D a_,
+            Point3D b_,
+            Point3D planePoint_,
+            Vector3D planeNormal_,
+            Vector3D basisB_,
+            Vector3D basisN_,
+            List<(Double x, Double y)> cs_) {
+            Double da = Vector3D.DotProduct(a_ - planePoint_, planeNormal_);
+            Double db = Vector3D.DotProduct(b_ - planePoint_, planeNormal_);
+            if (da == 0 && db == 0) return;
+            if (da * db > 0) return;
+            Double denom = da - db;
+            if (Math.Abs(denom) < 1e-18) return;
+            Double t = da / denom;
+            if (Double.IsNaN(t) || t < 0 || t > 1) return;
+            Point3D crossing = new(
+                a_.X + ((b_.X - a_.X) * t),
+                a_.Y + ((b_.Y - a_.Y) * t),
+                a_.Z + ((b_.Z - a_.Z) * t));
+            Vector3D d = crossing - planePoint_;
+            Double bx = Vector3D.DotProduct(d, basisB_);
+            Double ny = Vector3D.DotProduct(d, basisN_);
+            cs_.Add((bx, ny));
         }
 
         private static Double MeanCircleResidual(IReadOnlyList<(Double x, Double y)> pts_, Double a_, Double b_, Double r_) {
