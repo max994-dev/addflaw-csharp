@@ -613,11 +613,13 @@ namespace AddFlaw.Managers {
                 }
             }
 
-            // Aggressive multi-pass smoothing to produce a single smooth convex line.
-            // The sort above ensures no backtracking; smoothing removes cross-section noise.
-            Int32 arcSmooth = Math.Clamp(sensorPositions.Count / 5, 2, 10);
-            for (Int32 pass = 0; pass < 4; pass++)
-                sensorPositions = SmoothPathPreservingPinned(sensorPositions, arcSmooth, new HashSet<Int32>());
+            // Polynomial least-squares fit through the (sorted) arc midpoints. Degree 3 in
+            // chord-length parameter t allows a 3D-bending fillet but limits the curve to at
+            // most one inflection -- effectively forcing a single smooth convex line from
+            // start to end. Falls back to the un-fitted points if the fit is degenerate.
+            Int32 polyDegree = Math.Min(3, sensorPositions.Count - 1);
+            if (TryFitPolynomialPath(sensorPositions, polyDegree, sensorPositions.Count, out List<Point3D> fitted))
+                sensorPositions = fitted;
 
             _lastArcSamples = rawArcSamples;
 
@@ -864,29 +866,21 @@ namespace AddFlaw.Managers {
                     continue;
                 }
 
-                // True angular midpoint of the arc: the cross-section point whose angle
-                // (relative to the Kasa center) is closest to (θ_start + θ_end) / 2.
-                // "Median index" is wrong when cross-section points cluster unevenly along
-                // the arc -- the angular midpoint is independent of point density.
+                // Synthesize the EXACT arc midpoint on the fitted circle at the angular
+                // midpoint of the arc span. This is guaranteed to be the true geometric
+                // center of the arc -- distance r from the circle center, at the angular
+                // midpoint of the arc. Picking the nearest existing mesh-edge intersection
+                // would bias the result by mesh discretization; synthesizing on the fitted
+                // circle is independent of mesh density and point distribution.
                 Int32 arcStartSorted = (gapAfterSorted + 1) % nPts;
                 Double thetaArcStart = theta[arcStartSorted];
                 Double thetaArcEnd = theta[gapAfterSorted];
-                // Adjust for wrap-around through the ±π boundary.
                 if (thetaArcEnd < thetaArcStart) thetaArcEnd += 2.0 * Math.PI;
                 Double thetaMid = (thetaArcStart + thetaArcEnd) * 0.5;
-
-                Int32 bestSortedIdx = arcStartSorted;
-                Double bestAngDiff = Double.MaxValue;
-                for (Int32 j = 0; j < nPts; j++) {
-                    Int32 sIdx = (arcStartSorted + j) % nPts;
-                    Double ang = theta[sIdx];
-                    if (ang < thetaArcStart - 0.01) ang += 2.0 * Math.PI;
-                    Double diff = Math.Abs(ang - thetaMid);
-                    if (diff < bestAngDiff) { bestAngDiff = diff; bestSortedIdx = sIdx; }
-                }
-                (Double mx, Double my) = cs[order[bestSortedIdx]];
+                Double mx = a + (r * Math.Cos(thetaMid));
+                Double my = b + (r * Math.Sin(thetaMid));
                 Point3D arcMid3D = P + (B * mx) + (N2 * my);
-                result.Add(new SensorArcSample(i + 1, arcMid3D, 0, true));
+                result.Add(new SensorArcSample(i + 1, arcMid3D, r, true));
             }
             return result;
         }
@@ -1020,6 +1014,110 @@ namespace AddFlaw.Managers {
             a_ = a;
             b_ = b;
             r_ = Math.Sqrt(r2sq);
+            return true;
+        }
+
+        /// <summary>
+        /// Polynomial least-squares fit through a 3D point sequence, parameterised by chord
+        /// length t in [0, 1]. Each axis (X, Y, Z) is fitted independently as a polynomial
+        /// of degree d in t; the resulting curve is then resampled at uniform t.
+        ///
+        /// This is what produces the "single convex" sensor path: the noisy per-cross-section
+        /// arc midpoints are replaced by a smooth polynomial whose degree caps how many
+        /// inflections are allowed (degree 2 = guaranteed single-convex parabola, degree 3 =
+        /// at most one inflection, etc.). Outliers are absorbed into the least-squares average
+        /// instead of distorting the curve like they do with moving-average smoothing.
+        /// </summary>
+        private static Boolean TryFitPolynomialPath(
+            IReadOnlyList<Point3D> points_,
+            Int32 degree_,
+            Int32 outputCount_,
+            out List<Point3D> result_) {
+            result_ = [];
+            Int32 n = points_.Count;
+            if (n < degree_ + 1 || outputCount_ < 2 || degree_ < 1) return false;
+
+            Double[] tArr = new Double[n];
+            tArr[0] = 0;
+            for (Int32 i = 1; i < n; i++)
+                tArr[i] = tArr[i - 1] + (points_[i] - points_[i - 1]).Length;
+            Double total = tArr[n - 1];
+            if (total < 1e-12) return false;
+            for (Int32 i = 0; i < n; i++) tArr[i] /= total;
+
+            Int32 m = degree_ + 1;
+            Double[,] M = new Double[m, m];
+            Double[] bx = new Double[m];
+            Double[] by = new Double[m];
+            Double[] bz = new Double[m];
+            Double[] basis = new Double[m];
+
+            for (Int32 i = 0; i < n; i++) {
+                Double tp = 1.0;
+                for (Int32 j = 0; j < m; j++) { basis[j] = tp; tp *= tArr[i]; }
+                for (Int32 r = 0; r < m; r++) {
+                    for (Int32 c = 0; c < m; c++) M[r, c] += basis[r] * basis[c];
+                    bx[r] += basis[r] * points_[i].X;
+                    by[r] += basis[r] * points_[i].Y;
+                    bz[r] += basis[r] * points_[i].Z;
+                }
+            }
+
+            if (!TrySolveLinearSystem(M, bx, out Double[]? cx) ||
+                !TrySolveLinearSystem(M, by, out Double[]? cy) ||
+                !TrySolveLinearSystem(M, bz, out Double[]? cz) ||
+                cx is null || cy is null || cz is null) return false;
+
+            result_ = new List<Point3D>(outputCount_);
+            for (Int32 k = 0; k < outputCount_; k++) {
+                Double tk = (Double)k / (outputCount_ - 1);
+                Double tp = 1.0;
+                Double x = 0, y = 0, z = 0;
+                for (Int32 j = 0; j < m; j++) {
+                    x += cx[j] * tp;
+                    y += cy[j] * tp;
+                    z += cz[j] * tp;
+                    tp *= tk;
+                }
+                result_.Add(new Point3D(x, y, z));
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Solve the linear system M x = b using Gaussian elimination with partial pivoting.
+        /// </summary>
+        private static Boolean TrySolveLinearSystem(Double[,] M_, Double[] b_, out Double[]? x_) {
+            x_ = null;
+            Int32 n = b_.Length;
+            Double[,] A = new Double[n, n + 1];
+            for (Int32 i = 0; i < n; i++) {
+                for (Int32 j = 0; j < n; j++) A[i, j] = M_[i, j];
+                A[i, n] = b_[i];
+            }
+            for (Int32 i = 0; i < n; i++) {
+                Int32 maxRow = i;
+                Double maxVal = Math.Abs(A[i, i]);
+                for (Int32 k = i + 1; k < n; k++) {
+                    Double v = Math.Abs(A[k, i]);
+                    if (v > maxVal) { maxVal = v; maxRow = k; }
+                }
+                if (maxVal < 1e-15) return false;
+                if (maxRow != i) {
+                    for (Int32 j = 0; j <= n; j++) (A[i, j], A[maxRow, j]) = (A[maxRow, j], A[i, j]);
+                }
+                for (Int32 k = i + 1; k < n; k++) {
+                    Double f = A[k, i] / A[i, i];
+                    for (Int32 j = i; j <= n; j++) A[k, j] -= f * A[i, j];
+                }
+            }
+            Double[] x = new Double[n];
+            for (Int32 i = n - 1; i >= 0; i--) {
+                Double s = A[i, n];
+                for (Int32 j = i + 1; j < n; j++) s -= A[i, j] * x[j];
+                x[i] = s / A[i, i];
+            }
+            x_ = x;
             return true;
         }
 
