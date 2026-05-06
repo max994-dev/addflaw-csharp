@@ -559,6 +559,23 @@ namespace AddFlaw.Managers {
                     arcCenterPath = smoothed;
             }
 
+            // Polynomial least-squares fit can extrapolate slightly past the input data near
+            // the endpoints, putting the smoothed curve a hair outside the cap planes that
+            // bound the highlighted belt. Trim any output samples that fall outside the same
+            // cap planes used to clip the belt so the centerline always stays inside it.
+            ComputeEndCaps(tubePolyline,
+                out Point3D capStartPt, out Vector3D capStartFwd, out Boolean haveStartCap,
+                out Point3D capEndPt, out Vector3D capEndBack, out Boolean haveEndCap);
+            if (haveStartCap || haveEndCap) {
+                List<Point3D> trimmed = new(arcCenterPath.Count);
+                foreach (Point3D p in arcCenterPath) {
+                    if (haveStartCap && Vector3D.DotProduct(p - capStartPt, capStartFwd) < 0) continue;
+                    if (haveEndCap && Vector3D.DotProduct(p - capEndPt, capEndBack) < 0) continue;
+                    trimmed.Add(p);
+                }
+                if (trimmed.Count >= 2) arcCenterPath = trimmed;
+            }
+
             Point3DCollection lineSegs = [];
             AddPolylineAsSegments(lineSegs, arcCenterPath);
             Point3DCollection ptCol = [];
@@ -591,14 +608,34 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
+        /// Compute stable perpendicular cap planes at the start and end of a polyline using a
+        /// lookahead far enough past the immediate-next vertex to avoid the numerical noise
+        /// of using a tiny click-vs-centroid offset as the cap normal. Both the belt-triangle
+        /// filter and the centerline trimmer need the same cap geometry, so this is shared.
+        /// </summary>
+        private static void ComputeEndCaps(
+            IReadOnlyList<Point3D> polyline_,
+            out Point3D startPt_, out Vector3D startForward_, out Boolean haveStartCap_,
+            out Point3D endPt_, out Vector3D endBackward_, out Boolean haveEndCap_) {
+            Int32 n = polyline_.Count;
+            startPt_ = polyline_[0];
+            endPt_ = polyline_[n - 1];
+            Int32 startAheadIdx = Math.Min(n - 1, Math.Max(2, n / 8));
+            Int32 endBehindIdx = Math.Max(0, Math.Min(n - 3, n - 1 - Math.Max(2, n / 8)));
+            startForward_ = polyline_[startAheadIdx] - startPt_;
+            endBackward_ = polyline_[endBehindIdx] - endPt_;
+            haveStartCap_ = startForward_.LengthSquared > 1e-18;
+            haveEndCap_ = endBackward_.LengthSquared > 1e-18;
+            if (haveStartCap_) startForward_.Normalize();
+            if (haveEndCap_) endBackward_.Normalize();
+        }
+
+        /// <summary>
         /// Collect curvy fillet triangles inside a CAPPED tube of radius
         /// <paramref name="tubeRadius_"/> around the polyline. A triangle is included only if
         /// it (1) is curvy (a neighbour normal differs by &gt; 8 deg), (2) lies inside the
         /// tube (perpendicular distance to closest segment within tubeRadius), AND (3) is on
         /// the inside of perpendicular caps placed at the polyline's first and last vertex.
-        /// The caps reject triangles that fall behind the start vertex or past the end vertex,
-        /// so the highlight is strictly bounded by the start/end clicks instead of bulging
-        /// into the surrounding fillet at the endpoints.
         /// </summary>
         private static HashSet<Int32> CollectArcTriangles(
             ModelPartScanner.ScanResult scan_,
@@ -612,27 +649,9 @@ namespace AddFlaw.Managers {
             Double cosCurvyThresh = Math.Cos(8.0 * Math.PI / 180.0);
             Double tubeR2 = tubeRadius_ * tubeRadius_;
 
-            // Perpendicular caps at the polyline endpoints: a triangle whose centroid sits
-            // behind the start vertex (in the direction opposite the next polyline vertex)
-            // or past the end vertex (in the direction past the previous polyline vertex)
-            // is rejected. This keeps the highlight strictly between the two click points.
-            //
-            // The cap direction must be a STABLE displacement -- the immediate-next vertex is
-            // typically the centroid of the triangle the click landed on, so subtracting them
-            // gives a tiny, numerically-noisy vector whose normalised direction depends on
-            // arbitrary intra-triangle click position. Using a lookahead a few vertices deeper
-            // gives a stable path-direction vector that does not flip with sub-mm click noise.
-            Point3D startPt = guidePathPoints_[0];
-            Point3D endPt = guidePathPoints_[guidePathPoints_.Count - 1];
-            Int32 polyN = guidePathPoints_.Count;
-            Int32 startAheadIdx = Math.Min(polyN - 1, Math.Max(2, polyN / 8));
-            Int32 endBehindIdx = Math.Max(0, Math.Min(polyN - 3, polyN - 1 - Math.Max(2, polyN / 8)));
-            Vector3D startForward = guidePathPoints_[startAheadIdx] - startPt;
-            Vector3D endBackward = guidePathPoints_[endBehindIdx] - endPt;
-            Boolean haveStartCap = startForward.LengthSquared > 1e-18;
-            Boolean haveEndCap = endBackward.LengthSquared > 1e-18;
-            if (haveStartCap) startForward.Normalize();
-            if (haveEndCap) endBackward.Normalize();
+            ComputeEndCaps(guidePathPoints_,
+                out Point3D startPt, out Vector3D startForward, out Boolean haveStartCap,
+                out Point3D endPt, out Vector3D endBackward, out Boolean haveEndCap);
 
             for (Int32 t = 0; t < nTri; t++) {
                 if (!IsTriangleCurvy(scan_, t, cosCurvyThresh)) continue;
