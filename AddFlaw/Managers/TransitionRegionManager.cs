@@ -545,8 +545,8 @@ namespace AddFlaw.Managers {
             HashSet<Int32> arcTris = CollectArcTriangles(scan_, tubePolyline, tubeRadius);
             if (arcTris.Count == 0) return false;
 
-            Color arcColor = Color.FromArgb(0x66, 0xFF, 0x40, 0x80);
-            _arcSurfaceVisual.Content = BuildHighlightedTriangleModel(scan_, arcTris, arcColor);
+            // Belt overlay disabled: only the centerline + sample dots are drawn.
+            _arcSurfaceVisual.Content = null;
 
             // Compute the arc center path: cross-section the highlighted arc triangles at
             // uniform stations along the guide polyline; at each station the geometric centre
