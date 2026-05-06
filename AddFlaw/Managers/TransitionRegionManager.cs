@@ -545,17 +545,34 @@ namespace AddFlaw.Managers {
             HashSet<Int32> arcTris = CollectArcTriangles(scan_, tubePolyline, tubeRadius);
             if (arcTris.Count == 0) return false;
 
-            Color arcColor = Color.FromArgb(0xCC, 0xFF, 0x40, 0x80);
+            Color arcColor = Color.FromArgb(0x66, 0xFF, 0x40, 0x80);
             _arcSurfaceVisual.Content = BuildHighlightedTriangleModel(scan_, arcTris, arcColor);
 
-            // Clear all the path / probe / arc-center visuals: this rebuild step only shows
-            // the highlighted arc surface so we can confirm the region detection first.
+            // Compute the arc center path: cross-section the highlighted arc triangles at
+            // uniform stations along the guide polyline; at each station the geometric centre
+            // of the cross-section arc is the maximum-sagitta point (farthest from the chord
+            // between the two extremes). Polynomial fit smooths the result into a single curve.
+            List<Point3D> arcCenterPath = ComputeArcCenterPathFromTriangles(scan_, arcTris, tubePolyline, spacing);
+            if (arcCenterPath.Count >= 4) {
+                Int32 polyDeg = Math.Min(3, arcCenterPath.Count - 1);
+                if (TryFitPolynomialPath(arcCenterPath, polyDeg, arcCenterPath.Count, out List<Point3D> smoothed))
+                    arcCenterPath = smoothed;
+            }
+
+            Point3DCollection lineSegs = [];
+            AddPolylineAsSegments(lineSegs, arcCenterPath);
+            Point3DCollection ptCol = [];
+            foreach (Point3D p in arcCenterPath) ptCol.Add(p);
+
             _pathActiveLine = [];
             _pathActivePoints = [];
             _pathCommittedLine.Clear();
             _pathCommittedPoints.Clear();
-            _lineVisual.Points = [];
-            _pointVisual.Points = [];
+            foreach (Point3D p in lineSegs) _pathCommittedLine.Add(p);
+            foreach (Point3D p in ptCol) _pathCommittedPoints.Add(p);
+            _lineVisual.Points = new Point3DCollection(_pathCommittedLine);
+            _pointVisual.Points = new Point3DCollection(_pathCommittedPoints);
+
             _probeXVisual.Points = [];
             _probeYVisual.Points = [];
             _probeZVisual.Points = [];
@@ -570,7 +587,7 @@ namespace AddFlaw.Managers {
 
             _ = probeAnchor_;
             _ = middleAnchorIndex_;
-            return true;
+            return arcCenterPath.Count >= 2;
         }
 
         /// <summary>
@@ -626,6 +643,91 @@ namespace AddFlaw.Managers {
                     _ = result.Add(t);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Compute the arc-centre path by cross-sectioning ONLY the highlighted arc triangles.
+        /// At each station along the guide polyline the cross-section plane is perpendicular
+        /// to the path tangent. Edge intersections of the arc triangles with that plane form
+        /// a 2D arc curve in the plane's (B, N2) frame; the arc's geometric centre is the
+        /// MAXIMUM-SAGITTA point -- the curve sample farthest from the chord connecting the
+        /// curve's two extremes. This is robust to clustering of edge intersections and
+        /// guarantees the returned point lies on the actual arc (it IS one of the cross-
+        /// section samples).
+        /// </summary>
+        private static List<Point3D> ComputeArcCenterPathFromTriangles(
+            ModelPartScanner.ScanResult scan_,
+            HashSet<Int32> arcTris_,
+            List<Point3D> guidePath_,
+            Double spacing_) {
+            List<Point3D> result = [];
+            if (arcTris_.Count == 0 || guidePath_.Count < 2) return result;
+            if (!TryResamplePathWithSegments(guidePath_, spacing_, out List<Point3D>? samples, out _)
+                || samples is null || samples.Count < 2) return result;
+
+            List<(Double x, Double y)> cs = new(64);
+            for (Int32 i = 0; i < samples.Count; i++) {
+                Point3D P = samples[i];
+                Int32 prev = Math.Max(0, i - 2);
+                Int32 next = Math.Min(samples.Count - 1, i + 2);
+                Vector3D T = samples[next] - samples[prev];
+                if (T.LengthSquared < 1e-18) continue;
+                T.Normalize();
+
+                Vector3D B = OrthogonalToVector(T);
+                if (B.LengthSquared < 1e-18) continue;
+                B.Normalize();
+                Vector3D N2 = Vector3D.CrossProduct(T, B);
+                if (N2.LengthSquared < 1e-18) continue;
+                N2.Normalize();
+
+                cs.Clear();
+                foreach (Int32 tri in arcTris_)
+                    AddTriangleCrossSectionPoints(scan_, tri, P, T, B, N2, cs);
+                if (cs.Count < 2) continue;
+
+                Int32 e1 = 0, e2 = 0;
+                Double maxD2 = 0;
+                for (Int32 a = 0; a < cs.Count; a++) {
+                    for (Int32 b = a + 1; b < cs.Count; b++) {
+                        Double dx = cs[a].x - cs[b].x;
+                        Double dy = cs[a].y - cs[b].y;
+                        Double d2 = (dx * dx) + (dy * dy);
+                        if (d2 > maxD2) { maxD2 = d2; e1 = a; e2 = b; }
+                    }
+                }
+                if (maxD2 < 1e-18) continue;
+
+                Double chordX = cs[e2].x - cs[e1].x;
+                Double chordY = cs[e2].y - cs[e1].y;
+                Int32 bestIdx = e1;
+                Double bestPerp = -1;
+                for (Int32 a = 0; a < cs.Count; a++) {
+                    Double dx = cs[a].x - cs[e1].x;
+                    Double dy = cs[a].y - cs[e1].y;
+                    Double perp = Math.Abs((chordX * dy) - (chordY * dx));
+                    if (perp > bestPerp) { bestPerp = perp; bestIdx = a; }
+                }
+                (Double mx, Double my) = cs[bestIdx];
+                result.Add(P + (B * mx) + (N2 * my));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Pick a vector reasonably orthogonal to <paramref name="v_"/> by crossing it with
+        /// the world axis whose component in v_ has the smallest magnitude (most-orthogonal
+        /// world axis). This avoids the near-degenerate cross product you would get from
+        /// crossing v_ with an axis parallel to it.
+        /// </summary>
+        private static Vector3D OrthogonalToVector(Vector3D v_) {
+            Double ax = Math.Abs(v_.X);
+            Double ay = Math.Abs(v_.Y);
+            Double az = Math.Abs(v_.Z);
+            Vector3D axis = ax <= ay && ax <= az
+                ? new Vector3D(1, 0, 0)
+                : (ay <= az ? new Vector3D(0, 1, 0) : new Vector3D(0, 0, 1));
+            return Vector3D.CrossProduct(v_, axis);
         }
 
         /// <summary>
