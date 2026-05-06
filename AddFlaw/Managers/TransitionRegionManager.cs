@@ -42,7 +42,6 @@ namespace AddFlaw.Managers {
         private readonly ModelVisual3D _probeBodyVisual = new();
         private readonly ModelVisual3D _probeVisualRoot = new();
         private readonly PointsVisual3D _controlStartVisual = new() { Color = Color.FromRgb(0x2E, 0xCC, 0x71), Size = 10.0 };
-        private readonly PointsVisual3D _controlMiddleVisual = new() { Color = Color.FromRgb(0xF1, 0xC4, 0x0F), Size = 10.0 };
         private readonly PointsVisual3D _controlEndVisual = new() { Color = Color.FromRgb(0xE7, 0x4C, 0x3C), Size = 10.0 };
         private readonly LinesVisual3D _sideExpandVectorVisual = new() { Color = Color.FromRgb(0xFF, 0x66, 0xCC), Thickness = 1.4 };
         private readonly PointsVisual3D _sideExpandPointVisual = new() { Color = Color.FromRgb(0xB0, 0x5C, 0xFF), Size = 4.0 };
@@ -69,11 +68,9 @@ namespace AddFlaw.Managers {
         // re-run two A* searches across the whole mesh on every text-box update.
         private ModelPartScanner.ScanResult? _cachedScanForControl;
         private Point3D _cachedStartClick;
-        private Point3D _cachedMiddleClick;
         private Point3D _cachedEndClick;
         private List<Point3D>? _cachedAnchoredCenters;
         private List<Vector3D>? _cachedAnchoredNormals;
-        private Int32 _cachedMiddleAnchorIndex = -1;
         private readonly Point3DCollection _pathCommittedLine = [];
         private readonly Point3DCollection _pathCommittedPoints = [];
         private Point3DCollection _pathActiveLine = [];
@@ -93,8 +90,6 @@ namespace AddFlaw.Managers {
                 viewport_.Children.Add(_probeVisualRoot);
             if (!viewport_.Children.Contains(_controlStartVisual))
                 viewport_.Children.Add(_controlStartVisual);
-            if (!viewport_.Children.Contains(_controlMiddleVisual))
-                viewport_.Children.Add(_controlMiddleVisual);
             if (!viewport_.Children.Contains(_controlEndVisual))
                 viewport_.Children.Add(_controlEndVisual);
             if (!viewport_.Children.Contains(_sideExpandVectorVisual))
@@ -144,12 +139,10 @@ namespace AddFlaw.Managers {
             _cachedScanForControl = null;
             _cachedAnchoredCenters = null;
             _cachedAnchoredNormals = null;
-            _cachedMiddleAnchorIndex = -1;
         }
 
-        public void UpdateControlPointPreview(Point3D? startPoint_, Point3D? middlePoint_, Point3D? endPoint_) {
+        public void UpdateControlPointPreview(Point3D? startPoint_, Point3D? endPoint_) {
             _controlStartVisual.Points = startPoint_ is Point3D s ? [s] : [];
-            _controlMiddleVisual.Points = middlePoint_ is Point3D m ? [m] : [];
             _controlEndVisual.Points = endPoint_ is Point3D e ? [e] : [];
         }
 
@@ -258,7 +251,6 @@ namespace AddFlaw.Managers {
             ModelPartScanner.ScanResult scan_,
             Double spacingInch_,
             Point3D startPoint_,
-            Point3D middlePoint_,
             Point3D endPoint_) {
             // Reuse last anchored curve when only the spacing changed: pure draw, no path search.
             Boolean canReuse = ReferenceEquals(_cachedScanForControl, scan_)
@@ -266,38 +258,31 @@ namespace AddFlaw.Managers {
                 && _cachedAnchoredNormals is { Count: >= 2 }
                 && _cachedAnchoredCenters.Count == _cachedAnchoredNormals.Count
                 && PointsEqual(_cachedStartClick, startPoint_)
-                && PointsEqual(_cachedMiddleClick, middlePoint_)
                 && PointsEqual(_cachedEndClick, endPoint_);
 
             List<Point3D> centers;
             List<Vector3D> normals;
-            Int32 middleAnchorIndex;
             if (canReuse) {
                 centers = _cachedAnchoredCenters!;
                 normals = _cachedAnchoredNormals!;
-                middleAnchorIndex = _cachedMiddleAnchorIndex;
             } else {
                 if (!TryBuildAnchoredCurve(
                         scan_,
                         startPoint_,
-                        middlePoint_,
                         endPoint_,
                         out centers!,
-                        out normals!,
-                        out middleAnchorIndex)) {
+                        out normals!)) {
                     InvalidateAnchoredCurveCache();
                     return false;
                 }
                 _cachedScanForControl = scan_;
                 _cachedStartClick = startPoint_;
-                _cachedMiddleClick = middlePoint_;
                 _cachedEndClick = endPoint_;
                 _cachedAnchoredCenters = centers;
                 _cachedAnchoredNormals = normals;
-                _cachedMiddleAnchorIndex = middleAnchorIndex;
             }
 
-            return DrawFromAnchoredCurve(scan_, spacingInch_, centers, normals, middleAnchorIndex, middlePoint_);
+            return DrawFromAnchoredCurve(scan_, spacingInch_, centers, normals, startPoint_);
         }
 
         private static Boolean PointsEqual(Point3D a_, Point3D b_) =>
@@ -363,61 +348,37 @@ namespace AddFlaw.Managers {
         }
 
         /// <summary>
-        /// Build the unsampled centroid polyline for the start->middle->end control-point path.
-        /// Two A* searches over the triangle dual graph (start->mid, mid->end), then the user's
-        /// click positions are pinned at the polyline endpoints and at the join (middle anchor).
+        /// Build the unsampled centroid polyline for the start -> end control-point path with
+        /// a single A* search over the triangle dual graph. The user's click positions are used
+        /// only to locate the nearest start/end triangles; they are not inserted into the path.
         /// </summary>
         private static Boolean TryBuildAnchoredCurve(
             ModelPartScanner.ScanResult scan_,
             Point3D startPoint_,
-            Point3D middlePoint_,
             Point3D endPoint_,
             out List<Point3D>? centers_,
-            out List<Vector3D>? normals_,
-            out Int32 middleAnchorIndex_) {
+            out List<Vector3D>? normals_) {
             centers_ = null;
             normals_ = null;
-            middleAnchorIndex_ = -1;
             Int32 n = scan_.TriCenters.Count;
             if (n == 0 || scan_.TriAdjacency.Count != n || scan_.TriNormals.Count != n)
                 return false;
 
             Int32 startTri = FindNearestTriangle(scan_, startPoint_);
-            Int32 midTri = FindNearestTriangle(scan_, middlePoint_);
             Int32 endTri = FindNearestTriangle(scan_, endPoint_);
-            if (startTri < 0 || midTri < 0 || endTri < 0)
+            if (startTri < 0 || endTri < 0)
                 return false;
 
-            if (!TryAStarTrianglePath(scan_, startTri, midTri, out List<Int32>? a) || a is null)
+            if (!TryAStarTrianglePath(scan_, startTri, endTri, out List<Int32>? tris) || tris is null)
                 return false;
-            if (!TryAStarTrianglePath(scan_, midTri, endTri, out List<Int32>? b) || b is null)
-                return false;
-
-            // Concatenate the two halves; the duplicated mid triangle (b[0] == midTri == a[^1]) is dropped.
-            List<Int32> tris = new(a.Count + b.Count);
-            tris.AddRange(a);
-            for (Int32 i = 1; i < b.Count; i++)
-                tris.Add(b[i]);
             if (tris.Count < 1)
                 return false;
 
-            // Build [center(t0), center(t1), ..., center(tN)] from triangle centroids only.
-            // The user's start/end click positions are used solely to locate the nearest triangle;
-            // they are NOT inserted as path points because they may lie off the actual surface curve.
             centers_ = new List<Point3D>(tris.Count);
             normals_ = new List<Vector3D>(tris.Count);
             for (Int32 i = 0; i < tris.Count; i++) {
                 centers_.Add(scan_.TriCenters[tris[i]]);
                 normals_.Add(scan_.TriNormals[tris[i]]);
-            }
-
-            // midTri is at index a.Count - 1 in the all-centroid layout (a[^1] = midTri).
-            // Replace it with the user's middle-click point so the path still passes through that
-            // orientation anchor (the middle click is an intentional waypoint, not just a hint).
-            Int32 midIdx = a.Count - 1;
-            if (midIdx > 0 && midIdx < centers_.Count - 1) {
-                centers_[midIdx] = middlePoint_;
-                middleAnchorIndex_ = midIdx;
             }
             return centers_.Count >= 2;
         }
@@ -521,7 +482,6 @@ namespace AddFlaw.Managers {
             Double spacingInch_,
             List<Point3D> centers_,
             List<Vector3D> normals_,
-            Int32 middleAnchorIndex_,
             Point3D probeAnchor_) {
             if (centers_.Count < 2 || normals_.Count != centers_.Count) return false;
             if (scan_.MeshSlots.Count == 0) return false;
@@ -603,7 +563,6 @@ namespace AddFlaw.Managers {
             _lastPathSpacingInch = spacing;
 
             _ = probeAnchor_;
-            _ = middleAnchorIndex_;
             return arcCenterPath.Count >= 2;
         }
 

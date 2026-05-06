@@ -32,7 +32,6 @@ namespace AddFlaw {
         private Boolean _targetSphereGrowing = false;                                  // Target sphere render-loop state
         private DateTime _lastRenderTime = DateTime.MinValue;
         private Point3D? _lineStartPoint;
-        private Point3D? _lineMiddlePoint;
         private Point3D? _lineEndPoint;
         private Int32 _linePickStep;
         private Boolean _hasDrawnTransitionLine;
@@ -325,17 +324,16 @@ namespace AddFlaw {
                     _modelManager.SetModelColor(_modelColors[0]);
                     _lastScan = null;
                     _lineStartPoint = null;
-                    _lineMiddlePoint = null;
                     _lineEndPoint = null;
                     _linePickStep = 0;
                     _hasDrawnTransitionLine = false;
                     _isLineDrawMode = false;
                     _transitionRegionManager.ClearTransitionCenterline();
-                    _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+                    _transitionRegionManager.UpdateControlPointPreview(null, null);
                     if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
                     UpdateDrawLineButtonState();
                     filePathLabel.Text = Path.GetFileName(dialog.FileName);
-                    _uiStateManager.SetStatus("Model loaded. Turn on Draw Line, then click start, middle, and end points.");
+                    _uiStateManager.SetStatus("Model loaded. Turn on Draw Line, then click start and end points.");
                 } catch (Exception ex) {
                     _ = MessageBox.Show($"Error loading model: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     filePathLabel.Text = "Error loading file";
@@ -345,8 +343,8 @@ namespace AddFlaw {
         private void PointSpacingTextBox_LostFocus(Object sender_, RoutedEventArgs evt_) {
             if (_lastScan is null || !_hasDrawnTransitionLine) return;
             Double spacing = Math.Max(0.01, ParseDoubleOrDefault(pointSpacingTextBox?.Text ?? "0.1", 0.1));
-            if (_lineStartPoint is Point3D start && _lineMiddlePoint is Point3D middle && _lineEndPoint is Point3D end) {
-                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, middle, end);
+            if (_lineStartPoint is Point3D start && _lineEndPoint is Point3D end) {
+                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, end);
             }
             UpdateSensorAxisDisplay();
         }
@@ -359,8 +357,8 @@ namespace AddFlaw {
 
             Double clamped = Math.Max(0.01, spacing);
             pointSpacingTextBox.Text = clamped.ToString("0.###");
-            if (_lastScan is not null && _lineStartPoint is Point3D start && _lineMiddlePoint is Point3D middle && _lineEndPoint is Point3D end)
-                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, clamped, start, middle, end);
+            if (_lastScan is not null && _lineStartPoint is Point3D start && _lineEndPoint is Point3D end)
+                _ = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, clamped, start, end);
             UpdateSensorAxisDisplay();
             _uiStateManager.SetStatus($"Point spacing set to {clamped:0.###} in from line points.");
         }
@@ -372,7 +370,7 @@ namespace AddFlaw {
         }
 
         private Boolean HasLineOrControlSelection() =>
-            _hasDrawnTransitionLine || _lineStartPoint is not null || _lineMiddlePoint is not null || _lineEndPoint is not null;
+            _hasDrawnTransitionLine || _lineStartPoint is not null || _lineEndPoint is not null;
 
         private void DrawOneLineButton_Click(Object sender_, RoutedEventArgs evt_) {
             if (_modelManager?.ModelVisual?.Content is null) {
@@ -382,11 +380,10 @@ namespace AddFlaw {
             if (_isLineDrawMode && HasLineOrControlSelection()) {
                 _transitionRegionManager.ClearTransitionCenterline();
                 _lineStartPoint = null;
-                _lineMiddlePoint = null;
                 _lineEndPoint = null;
                 _linePickStep = 0;
                 _hasDrawnTransitionLine = false;
-                _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+                _transitionRegionManager.UpdateControlPointPreview(null, null);
                 if (sensorAxisValuesLabel is not null) sensorAxisValuesLabel.Text = "-";
                 UpdateDrawLineButtonState();
                 _uiStateManager.SetStatus("Cleared. Click start point.");
@@ -397,14 +394,13 @@ namespace AddFlaw {
                 _transitionRegionManager.EndLineDragSession();
             else {
                 _lineStartPoint = null;
-                _lineMiddlePoint = null;
                 _lineEndPoint = null;
                 _linePickStep = 0;
-                _transitionRegionManager.UpdateControlPointPreview(null, null, null);
+                _transitionRegionManager.UpdateControlPointPreview(null, null);
             }
             UpdateDrawLineButtonState();
             _uiStateManager.SetStatus(_isLineDrawMode
-                ? "Drawing mode ON: click start point, then middle point, then end point."
+                ? "Drawing mode ON: click start point, then end point."
                 : "Drawing mode OFF.");
         }
 
@@ -441,7 +437,7 @@ namespace AddFlaw {
         private Boolean TryDrawLineFromControlPoints(Boolean force_) {
             if (_modelManager?.ModelVisual?.Content is null)
                 return false;
-            if (_lineStartPoint is not Point3D start || _lineMiddlePoint is not Point3D middle || _lineEndPoint is not Point3D end)
+            if (_lineStartPoint is not Point3D start || _lineEndPoint is not Point3D end)
                 return false;
             _lastScan ??= ModelPartScanner.Scan(_modelManager.ModelVisual.Content);
             if (_lastScan.TotalTriangles == 0)
@@ -450,7 +446,7 @@ namespace AddFlaw {
             DateTime now = DateTime.UtcNow;
             if (!force_ && (now - _lastLineDrawAt).TotalMilliseconds < 12)
                 return false;
-            Boolean drawn = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, middle, end);
+            Boolean drawn = _transitionRegionManager.DrawTransitionCenterlineFromControlPoints(_lastScan, spacing, start, end);
             if (drawn) {
                 _hasDrawnTransitionLine = true;
                 _lastLineDrawAt = now;
@@ -784,25 +780,19 @@ namespace AddFlaw {
                     if (_linePickStep == 0) {
                         _lineStartPoint = hitPoint.Value;
                         _linePickStep = 1;
-                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
+                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineEndPoint);
                         UpdateDrawLineButtonState();
-                        _uiStateManager.SetStatus("Start point selected. Click middle point.");
-                    } else if (_linePickStep == 1) {
-                        _lineMiddlePoint = hitPoint.Value;
-                        _linePickStep = 2;
-                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
-                        UpdateDrawLineButtonState();
-                        _uiStateManager.SetStatus("Middle point selected. Click end point.");
+                        _uiStateManager.SetStatus("Start point selected. Click end point.");
                     } else {
                         _lineEndPoint = hitPoint.Value;
-                        _linePickStep = 3;
-                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineMiddlePoint, _lineEndPoint);
+                        _linePickStep = 2;
+                        _transitionRegionManager.UpdateControlPointPreview(_lineStartPoint, _lineEndPoint);
                         Boolean drawn = TryDrawLineFromControlPoints(true);
                         if (!drawn)
                             UpdateDrawLineButtonState();
                         _uiStateManager.SetStatus(drawn
-                            ? "Line drawn from middle toward start/end. Click Clear to try again."
-                            : "Failed to draw path. Click Clear, then pick start / middle / end again.");
+                            ? "Arc center path drawn. Click Clear to try again."
+                            : "Failed to draw path. Click Clear, then pick start / end again.");
                     }
                     evt_.Handled = true;
                 }
